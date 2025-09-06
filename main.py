@@ -1,118 +1,142 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.responses import JSONResponse
 from typing import Dict
-import io
-import numpy as np
+import shutil
+import os
+import uuid
+
 from PIL import Image
-import cv2
+import numpy as np
 
-app = FastAPI(title="XAU Scanner – Backend")
+APP_NAME = "XAU Scanner API"
+APP_VERSION = "0.2.0-image"
 
-# เปิด CORS ให้เว็บ PWA เรียกใช้ได้
+app = FastAPI(title=APP_NAME, version=APP_VERSION)
+
+# ───────────────────────── CORS ─────────────────────────
+# ปรับ origins ตามโดเมน Netlify/localhost ของคุณได้
+origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://*.netlify.app",
+    "https://xau-scanner.onrender.com",
+    "*"  # ถ้าต้องการล็อกให้ปลอดภัย ให้ลบ * แล้วใส่โดเมนจริงแทน
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ถ้าจะล็อกให้ใส่โดเมน Netlify ของพี่แทน *
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-# ------------------------------
-#  Image scanner (prototype)
-# ------------------------------
-def analyze_image_np(img_bgr: np.ndarray) -> Dict:
+# ──────────────────────── Helpers ───────────────────────
+def _analyze_trend_from_image(img: Image.Image) -> Dict:
     """
-    วิเคราะห์แนวโน้มแบบเร็วจากรูปกราฟด้วยเส้นขอบ/มุมเอียงของเส้น
-    - ใช้ Canny + HoughLinesP หาแนวเส้นเด่น ๆ
-    - สรุปมุม median เพื่อตัดสินใจ Up/Down/Sideways
+    วิเคราะห์ภาพแบบ 'placeholder heuristic'
+    - resize ให้เล็กลงเพื่อความเร็ว
+    - แปลงเป็นโทนเทา แล้วดูความสว่างเฉลี่ยเป็นรายคอลัมน์
+    - ทำ linear regression หา slope เพื่อประเมินทิศทาง
+    *** นี่เป็นตัวอย่างง่าย ๆ เพื่อให้ API ใช้งานได้ก่อน
     """
-    if img_bgr is None or img_bgr.size == 0:
-        return {"status": "ERROR", "reason": ["ภาพว่างหรืออ่านไม่ได้"]}
 
-    # ย่อภาพลด noise
-    h, w = img_bgr.shape[:2]
-    scale = 1000 / max(h, w)
-    if scale < 1:
-        img_bgr = cv2.resize(img_bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    # แปลงเป็น RGB/Gray
+    if img.mode != "RGB":
+        img = img.convert("RGB")
 
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    # ครอปกรอบภาพให้เหลือส่วนกราฟ (ด้านล่างตัดส่วนอินดิเคเตอร์ออกคร่าว ๆ 25%)
+    w, h = img.size
+    crop_box = (int(0.05 * w), int(0.08 * h), int(0.95 * w), int(0.75 * h))
+    img = img.crop(crop_box)
 
-    edges = cv2.Canny(gray, 60, 150)
-    lines = cv2.HoughLinesP(edges, rho=1, theta=np.pi / 180, threshold=60,
-                            minLineLength=40, maxLineGap=10)
+    # ลดขนาดเพื่อความเร็ว
+    target_w = 320
+    scale = target_w / img.size[0]
+    img = img.resize((target_w, max(32, int(img.size[1] * scale))))
 
-    if lines is None or len(lines) == 0:
-        return {
-            "status": "WATCH",
-            "direction": "SIDEWAYS",
-            "confidence": 0.2,
-            "reason": ["ไม่พบเส้นแนวโน้มเด่นชัด (เส้นน้อย)"]
-        }
+    # เป็น grayscale
+    gray = img.convert("L")
+    arr = np.asarray(gray, dtype=np.float32) / 255.0   # 0..1
 
-    # เก็บมุมเส้น (องศา) -90..90
-    angles = []
-    for l in lines[:, 0, :]:
-        x1, y1, x2, y2 = l
-        dx, dy = (x2 - x1), (y2 - y1)
-        if dx == 0:
-            angle = 90.0
-        else:
-            angle = np.degrees(np.arctan2(-(y2 - y1), dx))  # ลบเพราะแกน y ของภาพคว่ำ
-        # กรองเส้นแนวตั้ง/แนวนอนเกินไป
-        if abs(angle) > 5:  # ตัดเส้นเกือบแบน
-            angles.append(angle)
+    # ความสว่างเฉลี่ยรายคอลัมน์
+    col_mean = arr.mean(axis=0)
+    x = np.arange(col_mean.size, dtype=np.float32)
 
-    if len(angles) == 0:
-        return {
-            "status": "WATCH",
-            "direction": "SIDEWAYS",
-            "confidence": 0.25,
-            "reason": ["มีแต่เส้นแบนมาก จึงมองเป็นไซด์เวย์"]
-        }
+    # linear regression: slope = cov(x,y)/var(x)
+    x_mean = x.mean()
+    y_mean = col_mean.mean()
+    num = ((x - x_mean) * (col_mean - y_mean)).sum()
+    den = ((x - x_mean) ** 2).sum() + 1e-8
+    slope = float(num / den)
 
-    median_angle = float(np.median(angles))
-    spread = float(np.std(angles))
-    n = len(angles)
+    # ค่าความมั่นใจง่าย ๆ จากอัตราส่วน slope ต่อ noise
+    noise = float(np.std(col_mean))
+    score = float(min(1.0, max(0.0, abs(slope) / (noise + 1e-6) * 2.0)))
 
-    # ตัดสินใจทิศ
-    if median_angle > 8:
+    if slope > 0.0005:
         direction = "UP"
-    elif median_angle < -8:
+    elif slope < -0.0005:
         direction = "DOWN"
     else:
         direction = "SIDEWAYS"
 
-    # ประมาณความมั่นใจจากจำนวนเส้นและการกระจุกตัวของมุม
-    conf_count = min(n / 50.0, 1.0)      # n≥50 ≈ เต็ม
-    conf_spread = max(0.0, 1.0 - (spread / 25.0))  # มุมยิ่งแคบยิ่งมั่นใจ
-    confidence = round(0.5 * conf_count + 0.5 * conf_spread, 2)
-
     return {
-        "status": "SIGNAL",
-        "direction": direction,     # "UP" | "DOWN" | "SIDEWAYS"
-        "confidence": confidence,   # 0..1
-        "lines_used": n,
-        "median_angle_deg": round(median_angle, 2),
-        "spread_angle_deg": round(spread, 2),
+        "direction": direction,
+        "score": round(score, 3),
+        "slope": round(slope, 6),
+        "note": "Heuristic from image brightness trend (placeholder)."
     }
 
-@app.post("/scan_image")
+# ─────────────────────── Endpoints ──────────────────────
+@app.get("/health")
+def health():
+    return {"ok": True, "service": APP_NAME, "version": APP_VERSION}
+
+@app.get("/")
+def root():
+    return {"ok": True, "hint": "POST /scan-image with form-data 'file'."}
+
+@app.post("/scan-image")
 async def scan_image(file: UploadFile = File(...)):
+    # ตรวจสอบชนิดไฟล์เบื้องต้น
     if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="กรุณาอัปโหลดไฟล์รูปภาพ")
+        raise HTTPException(status_code=400, detail="กรุณาอัปโหลดไฟล์รูปภาพเท่านั้น")
 
-    raw = await file.read()
+    # จำกัดขนาดไฟล์ ~10MB
+    if file.size and file.size > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="ไฟล์ใหญ่เกินไป (จำกัด ~10MB)")
+
+    # เซฟไฟล์ชั่วคราว
+    ext = os.path.splitext(file.filename or "")[1] or ".png"
+    temp_name = f"upload_{uuid.uuid4().hex}{ext}"
     try:
-        pil = Image.open(io.BytesIO(raw)).convert("RGB")
-    except Exception:
-        raise HTTPException(status_code=400, detail="เปิดไฟล์รูปไม่ได้")
+        with open(temp_name, "wb") as buf:
+            shutil.copyfileobj(file.file, buf)
 
-    img_bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
-    result = analyze_image_np(img_bgr)
-    return result
+        # เปิดด้วย Pillow
+        img = Image.open(temp_name)
 
+        # วิเคราะห์เบื้องต้น
+        result = _analyze_trend_from_image(img)
+
+        # ตัวอย่างสัญญาณแบบง่าย (คุณปรับกลยุทธ์จริงทีหลังได้)
+        signal = {
+            "status": "OK",
+            "signal": "BUY" if result["direction"] == "UP" else ("SELL" if result["direction"] == "DOWN" else "WAIT"),
+            "reason": result,
+        }
+        return JSONResponse(signal)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Image processing error: {e}")
+    finally:
+        try:
+            if os.path.exists(temp_name):
+                os.remove(temp_name)
+        except:
+            pass
+
+@app.get("/version")
+def version():
+    return {"version": APP_VERSION}
