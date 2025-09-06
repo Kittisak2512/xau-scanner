@@ -1,8 +1,6 @@
 fastapi
 uvicorn[standard]
-pandas
-numpy
 python-multipart
+pillow
+numpy
 opencv-python-headless
-Pillow
-scikit-image
