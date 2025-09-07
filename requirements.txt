@@ -1,4 +1,4 @@
-fastapi==0.112.2
-uvicorn==0.30.6
-pillow==10.4.0
-numpy==1.26.4
+fastapi
+uvicorn
+pillow
+numpy
