@@ -1,258 +1,183 @@
-# main.py
-# -*- coding: utf-8 -*-
-
 from __future__ import annotations
-
-import io
+from typing import Literal, Optional, Dict
+from datetime import datetime, timezone
 import os
-import traceback
-from typing import Literal, Tuple, Dict, Any
 
-import numpy as np
-from PIL import Image, ImageOps
-
-from fastapi import FastAPI, File, UploadFile, Form
+import httpx
+import pandas as pd
+from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
 
 APP_NAME = "xau-scanner"
 APP_VERSION = "2025-09-07.1"
 
-# -----------------------------------------------------------------------------
-# FastAPI app + CORS
-# -----------------------------------------------------------------------------
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
-# ถ้าจะล็อคโดเมน Netlify ให้แทนที่ "*" ด้วย URL ของคุณ
+# ===== CORS =====
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # e.g. ["https://venerable-sorbet-db2690.netlify.app"]
+    allow_origins=["*"],  # แนะนำใส่เฉพาะโดเมน Netlify ของคุณ
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -----------------------------------------------------------------------------
-# Utilities
-# -----------------------------------------------------------------------------
-def _read_image(file: UploadFile) -> Image.Image:
-    """Read upload to PIL.Image (RGB)."""
-    raw = file.file.read()
-    img = Image.open(io.BytesIO(raw)).convert("RGB")
-    return img
+# ===== Config =====
+TF_TO_INTERVAL = {
+    "M5": "5min",
+    "M15": "15min",
+    "H1": "1h",
+    "H4": "4h",
+}
 
+def utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-def _to_gray_np(img: Image.Image) -> np.ndarray:
-    """Convert PIL.Image -> grayscale np.float32 [0..1]."""
-    g = ImageOps.grayscale(img)
-    arr = np.asarray(g, dtype=np.float32) / 255.0
-    return arr
+def ensure_interval(tf: str) -> str:
+    if tf not in TF_TO_INTERVAL:
+        raise HTTPException(400, f"Unsupported timeframe: {tf}")
+    return TF_TO_INTERVAL[tf]
 
-
-def _crop_right_side(img: np.ndarray, right_ratio: float = 0.2) -> np.ndarray:
-    """เอาเฉพาะด้านขวาสุด (ใช้ดู close ล่าสุด)."""
-    h, w = img.shape
-    x0 = int(w * (1.0 - right_ratio))
-    return img[:, x0:]
-
-
-def _center_band(img: np.ndarray, width_ratio: float = 0.2) -> np.ndarray:
-    """แถบตรงกลาง (ใช้เป็น baseline)."""
-    h, w = img.shape
-    band_w = int(w * width_ratio)
-    x0 = (w - band_w) // 2
-    return img[:, x0:x0 + band_w]
-
-
-def _estimate_box_levels(higher_img_gray: np.ndarray) -> Tuple[float, float]:
-    """
-    ประมาณ 'กรอบ' H1/H4 จากรูป (แบบ heuristic)
-    - เอาเฉพาะพื้นที่กึ่งกลางจอ เพื่อลด noise
-    - ใช้เปอร์เซ็นไทล์ 85% / 15% เป็นขอบบน/ล่างเชิงพิกเซล (ยิ่งดำ = ต่ำ)
-    คืนค่าเป็น (H_high_pix, H_low_pix) หน่วย pixel index (0=บน, h-1=ล่าง)
-    """
-    h, w = higher_img_gray.shape
-    band = higher_img_gray[:, int(w * 0.25): int(w * 0.75)]  # โฟกัสกลางจอ
-    # invert เพื่อให้ "เส้น/แท่ง" สว่างขึ้น (ภาพกราฟมักพื้นมืด แท่ง/เส้นสว่าง)
-    inv = 1.0 - band
-
-    # รวมแนวแกน x -> โปรไฟล์ตามแกน y
-    prof = inv.mean(axis=1)
-
-    # ใช้เปอร์เซ็นไทล์เป็นกรอบ (หยาบ ๆ)
-    # โปรไฟล์สูง = มีวัตถุมาก (เส้น/แท่ง), เลือกระดับบน/ล่างแบบคร่าว ๆ
-    top_idx = int(np.clip(np.percentile(np.arange(h), 15), 0, h - 1))
-    bot_idx = int(np.clip(np.percentile(np.arange(h), 85), 0, h - 1))
-
-    # สลับให้ top < bot
-    H_high_pix = float(min(top_idx, bot_idx))
-    H_low_pix = float(max(top_idx, bot_idx))
-    return H_high_pix, H_low_pix
-
-
-def _decide_break_close(
-    higher_img_gray: np.ndarray,
-    lower_img_gray: np.ndarray,
-    mode: Literal["break_close"] = "break_close",
-    margin_ratio: float = 0.02,
-) -> Dict[str, Any]:
-    """
-    ตัดสิน Break + Close (แบบ heuristic):
-    - ประมาณ box H_high_pix/H_low_pix จากภาพ higher TF
-    - ดูค่าเฉลี่ยสว่างของ 'ขอบขวา' ของภาพ lower TF เทียบกับค่ากลาง
-    - ถ้าสว่างกว่า baseline มาก -> สมมุติว่าแท่งเขียวแรง (UP)
-      ในทางกลับกัน -> DOWN
-    หมายเหตุ: นี่เป็น logic แบบภาพรวม (ไม่อ่านราคา) เพื่อให้มีสัญญาณใช้งานได้จริง
-    """
-    H_high_pix, H_low_pix = _estimate_box_levels(higher_img_gray)
-    box_height = max(1.0, H_low_pix - H_high_pix)
-
-    right = _crop_right_side(lower_img_gray, right_ratio=0.18)
-    base = _center_band(lower_img_gray, width_ratio=0.18)
-
-    # invert เพื่อเน้นแท่ง/เส้นให้มีค่าสูง
-    right_inv = 1.0 - right
-    base_inv = 1.0 - base
-
-    right_val = float(right_inv.mean())
-    base_val = float(base_inv.mean())
-    diff = right_val - base_val
-
-    # เกณฑ์ (ยิ่งภาพสว่างต่างจากฐานมาก -> ถือว่าแรง)
-    thr = 0.06  # ปรับได้
-
-    status = "WATCH"
-    signal = "WAIT"
-    direction = "SIDEWAYS"
-    entry_side = None  # "LONG" | "SHORT" | None
-
-    if mode == "break_close":
-        if diff > thr:
-            direction = "UP"
-            signal = "ENTRY"
-            status = "OK"
-            entry_side = "LONG"
-        elif diff < -thr:
-            direction = "DOWN"
-            signal = "ENTRY"
-            status = "OK"
-            entry_side = "SHORT"
-
-    return {
-        "status": status,
-        "signal": signal,
-        "reason": {
-            "direction": direction,
-            "score": round(diff, 6),
-            "note": "Heuristic from image brightness trend.",
-        },
-        "box": {
-            "higher_tf_box_top_pix": H_high_pix,
-            "higher_tf_box_bottom_pix": H_low_pix,
-            "box_height_pix": box_height,
-            "margin_pix": max(1.0, box_height * margin_ratio),
-        },
-        "entry_side": entry_side,
+# ===== TwelveData adapter =====
+async def fetch_ohlc_twelvedata(symbol: str, tf: str, api_key: str) -> pd.DataFrame:
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": symbol,
+        "interval": ensure_interval(tf),
+        "outputsize": "200",
+        "timezone": "UTC",
+        "apikey": api_key,
     }
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, params=params)
+        r.raise_for_status()
+        data = r.json()
+
+    if "status" in data and data["status"] == "error":
+        raise HTTPException(502, f"TwelveData error: {data.get('message')}")
+    if "values" not in data:
+        raise HTTPException(502, f"Unexpected TwelveData payload: {data}")
+
+    df = pd.DataFrame(data["values"])
+    df["open"] = df["open"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
+    df["close"] = df["close"].astype(float)
+    df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+    df = df.sort_values("datetime").set_index("datetime")
+    return df
 
 
-def _build_order_line(side: Literal["LONG", "SHORT"], sl: int, tp1: int, tp2: int) -> str:
-    # เนื่องจากเราอ่าน “ราคา” จากภาพไม่ได้แน่นอน จึงระบุเฉพาะรูปแบบ
-    # ผู้ใช้จะมองระดับราคาเอง (หรือเพิ่ม logic OCR แกนราคาในอนาคต)
-    return f"ENTRY {side} @ <break close> | SL {sl} | TP1 {tp1} | TP2 {tp2}"
+# ===== Models =====
+class ScanDataIn(BaseModel):
+    symbol: str = "XAU/USD"
+    higher_tf: Literal["H1", "H4"] = "H4"
+    lower_tf: Literal["M5", "M15"] = "M15"
+    sl_points: int = 250
+    tp1_points: int = 500
+    tp2_points: int = 1000
+    api_key: Optional[str] = None
+
+class EntryOut(BaseModel):
+    side: Literal["long", "short"]
+    price: float
+    sl: float
+    tp1: float
+    tp2: float
+
+class ScanDataOut(BaseModel):
+    status: Literal["ENTRY", "WATCH"]
+    reason: str
+    higher_tf: str
+    lower_tf: str
+    ref: Dict[str, float]
+    params: Dict[str, int]
+    entry: Optional[EntryOut] = None
+    order_line: Optional[str] = None
+    ts: str = Field(default_factory=utcnow_iso)
 
 
-# -----------------------------------------------------------------------------
-# Routes
-# -----------------------------------------------------------------------------
-@app.get("/")
-def root():
-    return {"app": APP_NAME, "version": APP_VERSION, "ok": True}
+# ===== Logic =====
+def compute_break_close(
+    df_higher: pd.DataFrame,
+    df_lower: pd.DataFrame,
+    higher_tf: str,
+    lower_tf: str,
+    sl_points: int,
+    tp1_points: int,
+    tp2_points: int,
+) -> ScanDataOut:
+    H_high = float(df_higher["high"].iloc[-1])
+    H_low = float(df_higher["low"].iloc[-1])
+    last_close = float(df_lower["close"].iloc[-1])
 
-
-@app.get("/health")
-def health():
-    return {"status": "healthy"}
-
-
-@app.get("/version")
-def version():
-    return {"version": APP_VERSION}
-
-
-@app.post("/scan-breakout")
-async def scan_breakout(
-    # ไฟล์ภาพ: lower TF (เช่น M15 หรือ M5) + higher TF (H1/H4)
-    lower: UploadFile = File(..., description="รูปกราฟ TF ต่ำ (เช่น M15/M5)"),
-    higher: UploadFile = File(..., description="รูปกราฟ TF สูง (เช่น H1/H4)"),
-    # TF strings
-    higher_tf: str = Form(..., description="เช่น 'H4' หรือ 'H1'"),
-    lower_tf: str = Form(..., description="เช่น 'M15' หรือ 'M5'"),
-    # จุด SL/TP เป็น 'points'
-    sl_points: int = Form(...),
-    tp1_points: int = Form(...),
-    tp2_points: int = Form(...),
-    # โหมด (ตอนนี้รองรับ break_close เป็นหลัก)
-    mode: Literal["break_close"] = Form("break_close"),
-):
-    """
-    วิเคราะห์ภาพ 2 TF:
-    - higher (H1/H4): ใช้ประมาณกรอบ
-    - lower (M5/M15): ใช้ตัดสิน break+close
-    คืนค่า:
-    - สถานะ, สัญญาณ, คำอธิบาย, รายละเอียดกรอบ, ข้อความคำสั่งเข้าออเดอร์
-    """
-    try:
-        # อ่านรูป
-        higher_img = _read_image(higher)
-        lower_img = _read_image(lower)
-
-        higher_g = _to_gray_np(higher_img)
-        lower_g = _to_gray_np(lower_img)
-
-        judge = _decide_break_close(higher_g, lower_g, mode=mode)
-
-        res: Dict[str, Any] = {
-            "status": judge["status"],
-            "signal": judge["signal"],
-            "ref": {
-                "higher_tf": higher_tf,
-                "lower_tf": lower_tf,
-            },
-            "params": {
-                "sl_points": sl_points,
-                "tp1_points": tp1_points,
-                "tp2_points": tp2_points,
-            },
-            "box": judge["box"],
-            "reason": judge["reason"],
-        }
-
-        side = judge.get("entry_side")
-        if side in ("LONG", "SHORT"):
-            res["order_line"] = _build_order_line(side, sl_points, tp1_points, tp2_points)
-
-        return JSONResponse(res)
-
-    except Exception as e:
-        tb = traceback.format_exc(limit=2)
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "ERROR",
-                "error": str(e),
-                "trace": tb,
-            },
+    if last_close > H_high:
+        side = "long"
+        entry = EntryOut(
+            side=side,
+            price=last_close,
+            sl=last_close - sl_points,
+            tp1=last_close + tp1_points,
+            tp2=last_close + tp2_points,
+        )
+        return ScanDataOut(
+            status="ENTRY",
+            reason="Break + Close เหนือกรอบ",
+            higher_tf=higher_tf,
+            lower_tf=lower_tf,
+            ref={"H_high": H_high, "H_low": H_low, "last": last_close},
+            params={"sl_points": sl_points, "tp1_points": tp1_points, "tp2_points": tp2_points},
+            entry=entry,
+            order_line=f"ENTRY LONG @ {entry.price:.2f} | SL {entry.sl:.2f} | TP1 {entry.tp1:.2f} | TP2 {entry.tp2:.2f}",
+        )
+    elif last_close < H_low:
+        side = "short"
+        entry = EntryOut(
+            side=side,
+            price=last_close,
+            sl=last_close + sl_points,
+            tp1=last_close - tp1_points,
+            tp2=last_close - tp2_points,
+        )
+        return ScanDataOut(
+            status="ENTRY",
+            reason="Break + Close ใต้กรอบ",
+            higher_tf=higher_tf,
+            lower_tf=lower_tf,
+            ref={"H_high": H_high, "H_low": H_low, "last": last_close},
+            params={"sl_points": sl_points, "tp1_points": tp1_points, "tp2_points": tp2_points},
+            entry=entry,
+            order_line=f"ENTRY SHORT @ {entry.price:.2f} | SL {entry.sl:.2f} | TP1 {entry.tp1:.2f} | TP2 {entry.tp2:.2f}",
+        )
+    else:
+        return ScanDataOut(
+            status="WATCH",
+            reason="ยังไม่ Breakout",
+            higher_tf=higher_tf,
+            lower_tf=lower_tf,
+            ref={"H_high": H_high, "H_low": H_low, "last": last_close},
+            params={"sl_points": sl_points, "tp1_points": tp1_points, "tp2_points": tp2_points},
         )
 
 
-# -----------------------------------------------------------------------------
-# Local run
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    import uvicorn
+# ===== API =====
+@app.post("/scan-breakout-data", response_model=ScanDataOut)
+async def scan_breakout_data(body: ScanDataIn):
+    api_key = body.api_key or os.getenv("TWELVEDATA_API_KEY")
+    if not api_key:
+        raise HTTPException(400, "Missing TwelveData API key.")
 
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+    df_higher = await fetch_ohlc_twelvedata(body.symbol, body.higher_tf, api_key)
+    df_lower = await fetch_ohlc_twelvedata(body.symbol, body.lower_tf, api_key)
+    return compute_break_close(
+        df_higher, df_lower,
+        body.higher_tf, body.lower_tf,
+        body.sl_points, body.tp1_points, body.tp2_points
+    )
 
+
+@app.get("/")
+def root():
+    return {"app": APP_NAME, "version": APP_VERSION, "ok": True}
