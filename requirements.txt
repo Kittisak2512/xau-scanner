@@ -1,11 +1,12 @@
-fastapi==0.112.2
-uvicorn[standard]==0.30.6
+pip>=24.2
+setuptools>=70
+wheel>=0.43
+
+fastapi==0.112.*
+uvicorn[standard]==0.30.*
+httpx==0.27.*
+
+numpy==1.26.4
+pandas==2.2.2
 python-multipart==0.0.9
-pillow==10.4.0
-
-# คู่ที่มี manylinux wheels ชัวร์บน py310
-numpy==1.24.4
-pandas==2.0.3
-
-requests==2.32.3
-pydantic==2.8.2
+pydantic==2.8.*
