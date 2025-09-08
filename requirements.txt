@@ -3,9 +3,9 @@ uvicorn[standard]==0.30.6
 python-multipart==0.0.9
 pillow==10.4.0
 
-# เวอร์ชันที่มี manylinux wheels สำหรับ py310/py311
-numpy==1.26.4
-pandas==2.1.4
+# คู่ที่มี manylinux wheels ชัวร์บน py310
+numpy==1.24.4
+pandas==2.0.3
 
 requests==2.32.3
 pydantic==2.8.2
