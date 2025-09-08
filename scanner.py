@@ -1,186 +1,110 @@
-# scanner.py
-import os
-import time
-import math
-import requests
-import numpy as np
+import os, math
+from datetime import datetime, timezone
+import pandas as pd
+import httpx
+from fastapi import HTTPException
 
-API_KEY = os.getenv("TWELVEDATA_API_KEY")
+TD_BASE = "https://api.twelvedata.com"
+TD_KEY = os.getenv("TWELVEDATA_API_KEY")  # ตั้งใน Render dashboard
 
-def _fetch(symbol: str, interval: str, outputsize: int = 200):
-    url = "https://api.twelvedata.com/time_series"
+# map ชื่อ TF UI -> TwelveData interval
+INTERVAL_MAP = {
+    "M5": "5min",
+    "M15": "15min",
+    "M30": "30min",
+    "H1": "1h",
+    "H4": "4h",
+}
+
+async def fetch_ohlc(symbol: str, interval: str, outputsize: int = 500) -> pd.DataFrame:
+    if not TD_KEY:
+        raise HTTPException(status_code=500, detail="TWELVEDATA_API_KEY not set")
     params = {
         "symbol": symbol,
         "interval": interval,
-        "apikey": API_KEY,
+        "apikey": TD_KEY,
         "outputsize": outputsize,
-        "order": "desc",
+        "format": "JSON",
     }
-    r = requests.get(url, params=params, timeout=15)
-    j = r.json()
-    if "values" not in j:
-        return None
-    vals = j["values"]
-    # ล่าสุดอยู่ index 0 (เพราะ order=desc)
-    # แปลงเป็น float
-    for v in vals:
-        for k in ("open", "high", "low", "close"):
-            v[k] = float(v[k])
-    return vals
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(f"{TD_BASE}/time_series", params=params)
+        data = r.json()
+        if "values" not in data:
+            raise HTTPException(status_code=502, detail=f"TwelveData error: {data}")
+        df = pd.DataFrame(data["values"])
+        # columns: datetime, open, high, low, close, volume
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        for col in ["open","high","low","close"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.sort_values("datetime").reset_index(drop=True)
+        return df
 
-def _prev_candle_box(values):
+def breakout_logic(h_df: pd.DataFrame, l_df: pd.DataFrame):
     """
-    รับรายการแท่ง (order=desc) -> ใช้ 'แท่งก่อนหน้า' ที่ index=1
-    คืนค่า (box_high, box_low) จาก open/close ของแท่งนั้น
+    กติกา: กล่องจาก TF สูง (H1/H4) = high/low ของแท่งล่าสุด
+    ถ้าแท่งล่าสุดของ TF ต่ำ (M5/M15) 'ปิด' ทะลุนอกกรอบ ให้ ENTRY ทันที
     """
-    if not values or len(values) < 2:
-        return None
-    prev = values[1]          # แท่งก่อนหน้า
-    box_high = max(prev["open"], prev["close"])
-    box_low  = min(prev["open"], prev["close"])
-    return box_high, box_low
+    if len(h_df) < 2 or len(l_df) < 2:
+        return {"status":"WAIT","reason":"ข้อมูลน้อยเกินไป"}
 
-def _latest_price(values):
-    return float(values[0]["close"])
+    # กล่องจากแท่งล่าสุด TF สูง
+    H_high = float(h_df.iloc[-1]["high"])
+    H_low  = float(h_df.iloc[-1]["low"])
+    last_close = float(l_df.iloc[-1]["close"])
 
-def scan_breakout_v2(
-    symbol="XAU/USD",
-    higher_tf="1h",     # หรือ "4h"
-    lower_tf="5min",    # หรือ "15min"
-    buffer_points=0.20,     # กันชนสำหรับเงื่อนเบรก
-    tolerance_points=0.50,  # ยอมให้แตะกรอบ +/- ค่านี้ ถือว่ารีเทส
-    tp1_factor=0.5,
-    tp2_factor=1.0,
-    small_sl_buffer=0.0    # จะเพิ่มกันชน SL ก็ได้ เช่น 0.05
-):
-    # 1) ดึงข้อมูล
-    higher_vals = _fetch(symbol, higher_tf, outputsize=50)
-    lower_vals  = _fetch(symbol, lower_tf,  outputsize=200)
-
-    if higher_vals is None or lower_vals is None:
-        return {"status": "ERROR", "reason": "ไม่สามารถดึงข้อมูลได้"}
-
-    # 2) ตีกรอบจากแท่งก่อนหน้าของ TF ใหญ่
-    box = _prev_candle_box(higher_vals)
-    if box is None:
-        return {"status": "ERROR", "reason": "ข้อมูล TF ใหญ่ไม่พอ"}
-    box_high, box_low = box
-    box_height = box_high - box_low
-    last = _latest_price(lower_vals)
-
-    # 3) ตรวจเบรกเอาต์
-    up_break   = last > (box_high + buffer_points)
-    down_break = last < (box_low - buffer_points)
-
-    # 4) ถ้าไม่เบรก → WATCH
-    if not up_break and not down_break:
-        return {
-            "status": "WATCH",
-            "reason": "ยังไม่เบรกกรอบ H1/H4",
-            "ref": {
-                "higher_tf": higher_tf,
-                "lower_tf": lower_tf,
-                "box_high": round(box_high, 2),
-                "box_low": round(box_low, 2),
-                "box_height": round(box_height, 2),
-                "last": round(last, 2),
-            }
-        }
-
-    # 5) ถ้าเบรกแล้ว → ตรวจรีเทส
-    # นิยาม “รีเทส”: กลับมาใกล้เส้นกรอบภายใน tolerance หรือ retrace >= 50%
-    # คำนวณจากราคาล่าสุด ๆ ใน TF เล็กช่วงหลังเบรก
-    closes = [float(v["close"]) for v in lower_vals[:50]][::-1]  # กลับลำดับให้เก่า->ใหม่
-    # หาแท่งที่เริ่มหลุดกรอบ
-    break_idx = None
-    if up_break:
-        for i, c in enumerate(closes):
-            if c > (box_high + buffer_points):
-                break_idx = i
-                break
-        ref_line = box_high
-        side = "BUY"
+    if last_close > H_high:
+        side = "LONG"
+        reason = "Break + Close เหนือกล่อง TF สูง"
+    elif last_close < H_low:
+        side = "SHORT"
+        reason = "Break + Close ใตั้กล่อง TF สูง"
     else:
-        for i, c in enumerate(closes):
-            if c < (box_low - buffer_points):
-                break_idx = i
-                break
-        ref_line = box_low
-        side = "SELL"
-
-    if break_idx is None:
-        # ปกติจะต้องเจอ ถ้าไม่เจอถือว่าพึ่งเบรก
         return {
-            "status": "BREAKOUT_WAIT_RETEST",
-            "side": "BUY" if up_break else "SELL",
-            "ref": {
-                "higher_tf": higher_tf,
-                "lower_tf": lower_tf,
-                "box_high": round(box_high, 2),
-                "box_low": round(box_low, 2),
-                "last": round(last, 2),
-            },
-            "note": "เพิ่งเบรก แต่ยังหาจุดเบรกในประวัติล่าสุดไม่เจอ"
+            "status":"WATCH",
+            "reason": "ยังไม่ Breakout โซน H1/H4",
+            "ref":{"higher_tf_high":H_high,"higher_tf_low":H_low,"last":last_close}
         }
+    return {"status":"ENTRY", "side":side, "reason":reason,
+            "ref":{"higher_tf_high":H_high,"higher_tf_low":H_low,"last":last_close}
+           }
 
-    # high/low นับจากจุดเบรกจนถึงล่าสุด เพื่อวัด %retrace
-    post = closes[break_idx:]  # ตั้งแต่แท่งเบรกเป็นต้นมา
-    if side == "BUY":
-        peak = max(post)
-        retrace = (peak - last)
-        full   = (peak - ref_line)
+def price_from_points(entry: float, points: int, side: str, tp: bool) -> float:
+    # points = หน่วย “พอยท์” (เช่น ทองคำ XAU/USD = 1 point = 1.0)
+    if side == "LONG":
+        return entry + points if tp else entry - points
     else:
-        trough = min(post)
-        retrace = (last - trough)
-        full   = (ref_line - trough)
+        return entry - points if tp else entry + points
 
-    retrace_ratio = retrace / full if full > 0 else 0.0
+async def compute_signal(symbol: str, higher_tf: str, lower_tf: str,
+                         sl_points: int, tp1_points: int, tp2_points: int):
+    h_int = INTERVAL_MAP[higher_tf]
+    l_int = INTERVAL_MAP[lower_tf]
 
-    # เงื่อนไขรีเทส
-    near_line = abs(last - ref_line) <= tolerance_points
-    half_pull = retrace_ratio >= 0.5
+    h_df = await fetch_ohlc(symbol, h_int, 300)
+    l_df = await fetch_ohlc(symbol, l_int, 300)
 
-    if not (near_line or half_pull):
-        return {
-            "status": "BREAKOUT_WAIT_RETEST",
-            "side": side,
-            "ref": {
-                "higher_tf": higher_tf,
-                "lower_tf": lower_tf,
-                "box_high": round(box_high, 2),
-                "box_low": round(box_low, 2),
-                "box_height": round(box_height, 2),
-                "last": round(last, 2),
-            },
-            "note": "เบรกแล้ว กำลังรอรีเทสเส้นกรอบหรือย่อ/เด้ง ≥ 50%"
-        }
+    br = breakout_logic(h_df, l_df)
+    if br.get("status") != "ENTRY":
+        # ส่งผลสรุประหว่างรอ
+        return br | {"higher_tf": higher_tf, "lower_tf": lower_tf}
 
-    # 6) พร้อมเข้าออเดอร์ → คำนวณ Entry/SL/TP
-    entry = ref_line  # เข้าที่เส้นกรอบ
-    if side == "BUY":
-        sl  = box_low - small_sl_buffer
-        tp1 = entry + tp1_factor * box_height
-        tp2 = entry + tp2_factor * box_height
-    else:
-        sl  = box_high + small_sl_buffer
-        tp1 = entry - tp1_factor * box_height
-        tp2 = entry - tp2_factor * box_height
+    side = br["side"]
+    last = float(l_df.iloc[-1]["close"])
 
+    sl  = price_from_points(last, sl_points, side, tp=False)
+    tp1 = price_from_points(last, tp1_points, side, tp=True)
+    tp2 = price_from_points(last, tp2_points, side, tp=True)
+
+    txt = f"ENTRY {side} @ {last:.2f} | SL {sl:.2f} | TP1 {tp1:.2f} | TP2 {tp2:.2f}"
     return {
-        "status": "ENTRY_READY",
+        "status": "ENTRY",
         "side": side,
-        "entry": round(entry, 2),
-        "sl": round(sl, 2),
-        "tp1": round(tp1, 2),
-        "tp2": round(tp2, 2),
-        "ref": {
-            "higher_tf": higher_tf,
-            "lower_tf": lower_tf,
-            "box_high": round(box_high, 2),
-            "box_low": round(box_low, 2),
-            "box_height": round(box_height, 2),
-            "last": round(last, 2)
-        },
-        "note": "Breakout แล้วรีเทสเส้นกรอบ/50% — พร้อมเข้าออเดอร์"
+        "entry": last,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "message": txt,
+        "higher_tf": higher_tf,
+        "lower_tf": lower_tf,
+        "box": br["ref"],
     }
-
