@@ -1,17 +1,5 @@
-# --- bootstrap tools (ช่วยให้ build ผ่าน) ---
-pip==24.2
-setuptools<70
-wheel
-
-# --- web api ---
-fastapi==0.110.0
-uvicorn==0.29.0
-python-multipart==0.0.9
-
-# --- utils ---
+fastapi==0.115.0
+uvicorn==0.30.6
 requests==2.31.0
-python-dotenv==1.0.1
-
-# --- data / calc (ระวังเวอร์ชัน เพื่อเลี่ยง build หนัก) ---
-pandas==2.2.2
-numpy==1.26.4
+pandas==2.0.3
+python-dotenv==1.0.0
