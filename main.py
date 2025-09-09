@@ -1,267 +1,295 @@
 import os
 import math
-from typing import Optional, Literal, List, Dict, Any
-from datetime import datetime, timedelta, timezone
+from typing import Optional, Literal, Dict, Any
 
-import requests
-from fastapi import FastAPI, HTTPException
+import httpx
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-APP_NAME = "xau-scanner"
-APP_VERSION = datetime.now(timezone.utc).strftime("%Y-%m-%d.%H%M")
-
-# -------- Config from ENV --------
+# -----------------------------
+# Env & constants
+# -----------------------------
 TD_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 if not TD_API_KEY:
-    # ให้รันได้แม้ยังไม่ใส่คีย์ แต่จะ error ตอนยิง /signal
-    pass
+    # ให้รันได้แม้ลืมใส่ key (จะแจ้งเตือนในผลลัพธ์)
+    TD_API_KEY = "MISSING_API_KEY"
 
-# CORS
-_allowed_env = os.getenv("ALLOWED_ORIGINS", "*").strip()
-if _allowed_env == "" or _allowed_env == "*":
-    ALLOWED_ORIGINS: List[str] = ["*"]
-else:
-    ALLOWED_ORIGINS = [o.strip() for o in _allowed_env.split(",") if o.strip()]
+ALLOWED = os.getenv("ALLOWED_ORIGINS", "*")
+allow_origins = [o.strip() for o in ALLOWED.split(",") if o.strip()] or ["*"]
 
-# ----------- FastAPI -------------
-app = FastAPI(title="XAU Scanner — M5/M15 Signals", version=APP_VERSION)
+TD_BASE = "https://api.twelvedata.com"
+
+# แมปชื่อ TF -> interval ของ TwelveData
+INTERVAL_MAP = {
+    "M5": "5min",
+    "M15": "15min",
+    "H1": "1h",
+    "H4": "4h",
+}
+
+# ดึงไม่เกิน ~3 ชั่วโมงย้อนหลังสำหรับ TF ต่ำ
+LOOKBACK_BARS = {
+    "M5": 36,   # ~3 ชม.
+    "M15": 12,  # ~3 ชม.
+}
+
+# -----------------------------
+# FastAPI
+# -----------------------------
+app = FastAPI(title="xau-scanner", version="2025-09-09.3")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- Models ---------------
-TFType = Literal["M5", "M15"]
+
+# -----------------------------
+# Schemas
+# -----------------------------
+TFHigh = Literal["H1", "H4"]
+TFLow = Literal["M5", "M15"]
 
 class SignalRequest(BaseModel):
-    symbol: str = Field(default="XAU/USD", description="เช่น XAU/USD")
-    tf: TFType = Field(default="M5", description="M5 หรือ M15")
-
-    # เผื่อ front-end เดิมยังยิงมา (ไม่ใช้ในการคำนวณ แต่วางไว้กันพัง)
-    sl_points: Optional[float] = None
-    tp1_points: Optional[float] = None
-    tp2_points: Optional[float] = None
+    symbol: str = Field(..., example="XAU/USD")
+    tf_high: TFHigh = Field(..., example="H4")
+    tf_low: TFLow = Field(..., example="M5")
 
 
-class SignalResponse(BaseModel):
-    status: Literal["OK", "WAIT", "ERROR"]
-    symbol: str
-    tf: TFType
-    signal: Optional[Literal["BUY", "SELL"]] = None
-    entry: Optional[float] = None
-    sl: Optional[float] = None
-    tp1: Optional[float] = None
-    tp2: Optional[float] = None
-    support: Optional[float] = None
-    resistance: Optional[float] = None
-    box_window: str
-    message: str
-    overlay: Optional[str] = None
-    raw: Optional[Dict[str, Any]] = None
+# -----------------------------
+# Helpers
+# -----------------------------
+def _num(v: Any) -> Optional[float]:
+    try:
+        return float(v)
+    except Exception:
+        return None
 
 
-# -------- Utilities --------------
-def td_interval(tf: TFType) -> str:
-    return "5min" if tf == "M5" else "15min"
-
-def lookback_count(tf: TFType) -> int:
-    # 2–3 ชั่วโมง: M5 ~ 36, M15 ~ 12
-    return 36 if tf == "M5" else 12
-
-def round_price(x: float) -> float:
-    # ทองคำโบรกส่วนมาก 2 จุดทศนิยมพอ
-    return round(float(x), 2)
-
-def fetch_candles(symbol: str, tf: TFType, api_key: str) -> List[Dict[str, Any]]:
+async def td_time_series(symbol: str, interval: str, outputsize: int = 50) -> Dict[str, Any]:
     """
-    ดึง OHLC จาก TwelveData (ล่าสุดมาก่อน) แล้ว reverse ให้เก่าสุด -> ใหม่สุด
-    โครงสร้างคาดหวัง: {"values":[{"datetime": "...","open":"..","high":"..","low":"..","close":".."}, ...]}
+    เรียก TwelveData /time_series
+    คืน dict (raw JSON) | {"error": "..."} เมื่อผิดพลาด
     """
-    url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol,
-        "interval": td_interval(tf),
-        "outputsize": max(lookback_count(tf) + 5, 40),  # +เผื่อขาด
-        "format": "JSON",
-        "apikey": api_key,
+        "interval": interval,
+        "outputsize": str(outputsize),
+        "order": "DESC",
+        "apikey": TD_API_KEY,
     }
-    try:
-        r = requests.get(url, params=params, timeout=12)
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"TwelveData request error: {e}")
-
-    try:
+    url = f"{TD_BASE}/time_series"
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, params=params)
+        if r.status_code != 200:
+            return {"error": f"HTTP {r.status_code}"}
         data = r.json()
-    except Exception:
-        raise HTTPException(status_code=502, detail="TwelveData returned non-JSON")
-
-    if "values" not in data:
-        # ส่งดิบกลับให้ดีบักได้ง่าย
-        raise HTTPException(status_code=502, detail=f"TwelveData bad payload: {data}")
-
-    vals = data["values"]
-    if not isinstance(vals, list) or len(vals) < 5:
-        raise HTTPException(status_code=502, detail="Not enough candles from TwelveData")
-
-    # ล่าสุดมาก่อน -> reverse
-    vals = list(reversed(vals))
-    # แปลง numeric
-    cleaned = []
-    for v in vals:
-        try:
-            cleaned.append({
-                "dt": v["datetime"],
-                "open": float(v["open"]),
-                "high": float(v["high"]),
-                "low": float(v["low"]),
-                "close": float(v["close"]),
-            })
-        except Exception:
-            # ข้ามแถวที่แปลงไม่ได้
-            continue
-    return cleaned
+        if "status" in data and data["status"] == "error":
+            return {"error": data.get("message", "twelvedata error")}
+        return data
 
 
-def compute_levels(candles: List[Dict[str, Any]], tf: TFType) -> Dict[str, float]:
+def previous_bar(values: list) -> Optional[dict]:
     """
-    ใช้ lookback ~2–3 ชม. 'ก่อนหน้า' แท่งปิดล่าสุด เพื่อหาแนวรับ/แนวต้าน
-    - support = min(low) ในช่วง lookback
-    - resistance = max(high) ในช่วง lookback
+    คืนแท่งที่ 'ปิดล่าสุด' จาก list ที่เรียง DESC ของ TwelveData
+    ค่าใน values[0] คือแท่งล่าสุดที่ 'ปิดแล้ว' (TD ส่งค่าปิดมาเท่านั้น)
     """
-    n = lookback_count(tf)
-    if len(candles) < n + 2:
-        # เผื่อข้อมูลน้อย
-        n = min(len(candles) - 2, n)
+    if not values or not isinstance(values, list):
+        return None
+    return values[0]
 
-    # ปิดล่าสุดใช้แท่ง [-1], "last_closed" = แท่งก่อนล่าสุด [-2] (กันหลุดระหว่างแท่ง)
-    last_closed = candles[-2]
-    window = candles[-(n+2):-2]  # exclude last two bars
 
-    sup = min(c["low"] for c in window)
-    res = max(c["high"] for c in window)
+def last_n(values: list, n: int) -> list:
+    if not values:
+        return []
+    return values[: max(0, n)]
 
+
+def make_box_from_high_tf(prev_bar: dict) -> Optional[dict]:
+    """สร้างกรอบจาก high/low ของแท่งก่อนหน้าของ TF สูง"""
+    if not prev_bar:
+        return None
+    hi = _num(prev_bar.get("high"))
+    lo = _num(prev_bar.get("low"))
+    if hi is None or lo is None:
+        return None
+    # ให้ box_upper > box_lower เสมอ
+    upper = max(hi, lo)
+    lower = min(hi, lo)
     return {
-        "support": round_price(sup),
-        "resistance": round_price(res),
-        "last_closed": last_closed,  # ส่งกลับใช้ตัดสิน
-        "count": len(window),
+        "datetime": prev_bar.get("datetime"),
+        "high": hi,
+        "low": lo,
+        "box_upper": upper,
+        "box_lower": lower,
     }
 
 
-def make_signal(last: Dict[str, Any], support: float, resistance: float) -> Dict[str, Any]:
+def detect_breakout_and_plan(values_low: list, box_upper: float, box_lower: float) -> dict:
     """
-    เงื่อนไขซิกแนล:
-    - BUY  เมื่อ close > resistance และ open <= resistance (ทะลุ + ปิดเหนือโซน)
-    - SELL เมื่อ close < support    และ open >= support    (ทะลุลง + ปิดใต้โซน)
+    ตรวจเบรกเอาท์จาก TF ต่ำ (list เรียง DESC: แท่งใหม่สุดอยู่ index 0)
+    คืนผล:
+    {
+      "break": "UP"/"DOWN"/None,
+      "at": close_price,
+      "entry": suggested_entry,
+      "entry_50": suggested_50_pullback,
+      "sl": stop_loss,
+      "tp1": target1,
+      "tp2": target2,
+      "last_closed": { ... }
+    }
     """
-    o = last["open"]
-    h = last["high"]
-    l = last["low"]
-    c = last["close"]
+    out = {
+        "break": None,
+        "last_closed": None,
+        "at": None,
+        "entry": None,
+        "entry_50": None,
+        "sl": None,
+        "tp1": None,
+        "tp2": None,
+    }
+    if not values_low:
+        return out
 
-    if (c > resistance) and (o <= resistance):
-        side = "BUY"
-        entry = c
-        sl = l
-        risk = abs(entry - sl)
-        if risk <= 0:
-            return {"signal": None}
-        tp1 = entry + risk
-        tp2 = entry + 2 * risk
-        return {
-            "signal": side,
-            "entry": round_price(entry),
-            "sl": round_price(sl),
-            "tp1": round_price(tp1),
-            "tp2": round_price(tp2),
-        }
+    last = values_low[0]
+    out["last_closed"] = last
+    close0 = _num(last.get("close"))
+    if close0 is None:
+        return out
 
-    if (c < support) and (o >= support):
-        side = "SELL"
-        entry = c
-        sl = h
-        risk = abs(entry - sl)
-        if risk <= 0:
-            return {"signal": None}
-        tp1 = entry - risk
-        tp2 = entry - 2 * risk
-        return {
-            "signal": side,
-            "entry": round_price(entry),
-            "sl": round_price(sl),
-            "tp1": round_price(tp1),
-            "tp2": round_price(tp2),
-        }
+    # เงื่อนไขเบรก
+    if close0 > box_upper:
+        out["break"] = "UP"
+        out["at"] = close0
+        # แผนเข้าเมื่อรีเทสต์ขอบบน
+        out["entry"] = box_upper
+        out["entry_50"] = box_upper + (close0 - box_upper) * 0.5
+        # SL ใต้กรอบนิดนึง
+        out["sl"] = box_upper - (box_upper - box_lower) * 0.25
+        # TP อย่างง่าย: ระยะเท่าความกว้างกรอบ และ 1.5x
+        box_height = (box_upper - box_lower)
+        out["tp1"] = close0 + box_height * 1.0
+        out["tp2"] = close0 + box_height * 1.5
 
-    return {"signal": None}
+    elif close0 < box_lower:
+        out["break"] = "DOWN"
+        out["at"] = close0
+        out["entry"] = box_lower
+        out["entry_50"] = box_lower - (box_lower - close0) * 0.5
+        out["sl"] = box_lower + (box_upper - box_lower) * 0.25
+        box_height = (box_upper - box_lower)
+        out["tp1"] = close0 - box_height * 1.0
+        out["tp2"] = close0 - box_height * 1.5
+
+    return out
 
 
-def overlay_text(sig: str, entry: float, sl: float, tp1: float, tp2: float) -> str:
-    side = "LONG" if sig == "BUY" else "SHORT"
-    return f"ENTRY {side} @ {entry:.2f} | SL {sl:.2f} | TP1 {tp1:.2f} | TP2 {tp2:.2f}"
-
-
-# ------------- Routes -------------
+# -----------------------------
+# Routes
+# -----------------------------
 @app.get("/")
 def root():
-    return {"app": APP_NAME, "version": APP_VERSION, "ok": True}
+    return {"app": "xau-scanner", "version": app.version, "ok": True}
+
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "time": datetime.now(timezone.utc).isoformat()}
+    return {"ok": True, "twelvedata_key": "set" if os.getenv("TWELVEDATA_API_KEY") else "missing"}
 
-@app.post("/signal", response_model=SignalResponse)
-def get_signal(req: SignalRequest):
-    if not TD_API_KEY:
-        raise HTTPException(status_code=500, detail="Missing TWELVEDATA_API_KEY")
 
-    # 1) ดึงข้อมูลจาก TwelveData
-    candles = fetch_candles(req.symbol, req.tf, TD_API_KEY)
+@app.post("/signal")
+async def signal(req: SignalRequest):
+    if TD_API_KEY == "MISSING_API_KEY":
+        return {
+            "status": "ERROR",
+            "message": "TWELVEDATA_API_KEY is missing in environment.",
+        }
 
-    # 2) หาแนวรับต้านจากหน้าต่าง 2–3 ชั่วโมง (ยกเว้นแท่งล่าสุด)
-    levels = compute_levels(candles, req.tf)
-    support = levels["support"]
-    resistance = levels["resistance"]
-    last = levels["last_closed"]
+    symbol = req.symbol
+    tf_high = req.tf_high
+    tf_low = req.tf_low
 
-    # 3) ตัดสินซิกแนลจากแท่งปิดล่าสุด
-    sig = make_signal(last, support, resistance)
+    # 1) ดึงแท่งล่าสุด (ปิดแล้ว) ของ TF สูง เพื่อทำกรอบจาก high/low
+    data_high = await td_time_series(symbol, INTERVAL_MAP[tf_high], outputsize=2)
+    if "error" in data_high:
+        return {"status": "ERROR", "message": f"High TF fetch error: {data_high['error']}"}
+    values_high = data_high.get("values") or []
+    prev_h = previous_bar(values_high)  # ล่าสุดที่ปิดแล้ว
+    box = make_box_from_high_tf(prev_h)
+    if not box:
+        return {"status": "ERROR", "message": "Cannot build high/low box from high TF."}
 
-    box_desc = f"lookback={levels['count']} bars (~2–3h @ {req.tf})"
-    if sig["signal"] is None:
-        return SignalResponse(
-            status="WAIT",
-            symbol=req.symbol,
-            tf=req.tf,
-            signal=None,
-            support=support,
-            resistance=resistance,
-            box_window=box_desc,
-            message="WAIT — ราคายังไม่ปิดทะลุโซนแนวรับ/ต้าน ภายใน 2–3 ชม.",
-            raw={"last_closed": last},
+    # 2) ดึงแท่ง TF ต่ำ (3 ชม. ล่าสุด)
+    lookback = LOOKBACK_BARS[tf_low]
+    data_low = await td_time_series(symbol, INTERVAL_MAP[tf_low], outputsize=lookback)
+    if "error" in data_low:
+        return {"status": "ERROR", "message": f"Low TF fetch error: {data_low['error']}"}
+    values_low = data_low.get("values") or []
+    bars_low = last_n(values_low, lookback)
+
+    # 3) ตรวจ Breakout + แผนเข้า (รีเทสต์ / 50%)
+    plan = detect_breakout_and_plan(bars_low, box["box_upper"], box["box_lower"])
+
+    # 4) สร้างผลลัพธ์และคำแนะนำ
+    status = "OK"
+    message = "WAIT — ราคายังไม่เบรกกรอบใน TF ต่ำ ภายใน 2–3 ชม."
+    sig: Optional[str] = None
+    entry = sl = tp1 = tp2 = None
+
+    if plan["break"] == "UP":
+        sig = "BUY"
+        message = (
+            "BREAKOUT ขึ้นเหนือกรอบบน — รอรีเทสต์เส้นกรอบบน (หรือ Pullback ~50%) เพื่อเข้าซื้อ"
         )
+        entry = plan["entry"]
+        sl = plan["sl"]
+        tp1 = plan["tp1"]
+        tp2 = plan["tp2"]
 
-    # 4) จัดรูปซิกแนลพร้อม overlay
-    text = overlay_text(sig["signal"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"])
+    elif plan["break"] == "DOWN":
+        sig = "SELL"
+        message = (
+            "BREAKOUT ลงใต้กรอบล่าง — รอรีเทสต์เส้นกรอบล่าง (หรือ Pullback ~50%) เพื่อเข้าขาย"
+        )
+        entry = plan["entry"]
+        sl = plan["sl"]
+        tp1 = plan["tp1"]
+        tp2 = plan["tp2"]
 
-    return SignalResponse(
-        status="OK",
-        symbol=req.symbol,
-        tf=req.tf,
-        signal=sig["signal"],
-        entry=sig["entry"],
-        sl=sig["sl"],
-        tp1=sig["tp1"],
-        tp2=sig["tp2"],
-        support=support,
-        resistance=resistance,
-        box_window=box_desc,
-        message="Signal generated by Break+Close rule.",
-        overlay=text,
-        raw={"last_closed": last},
-    )
+    response = {
+        "status": status,
+        "symbol": symbol,
+        "tf_high": tf_high,
+        "tf_low": tf_low,
+        "message": message,
+        "signal": sig,          # BUY / SELL / None
+        "entry": entry,         # แผนเข้าที่เส้นกรอบ
+        "entry_50": plan["entry_50"],  # แผนเข้าแบบ 50% ของระยะแตกต่าง
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "box": {
+            "upper": box["box_upper"],
+            "lower": box["box_lower"],
+            "ref_bar": {
+                "datetime": box["datetime"],
+                "high": box["high"],
+                "low": box["low"],
+            },
+            "hint": "กรอบจาก high/low ของแท่งก่อนหน้าใน TF สูง",
+        },
+        "overlay": {
+            "note": "ใช้กรอบบน/ล่างประกอบกับ TF ต่ำ — รอรีเทสต์หรือ 50% pullback เพื่อเข้า",
+            "trend_view": f"ดูทิศทางจาก H1/H4 (กรอบอ้างอิง {tf_high})",
+        },
+        "raw": {
+            "last_closed_low_tf": plan["last_closed"],
+        },
+    }
+    return response
