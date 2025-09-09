@@ -1,268 +1,178 @@
-# main.py
-from __future__ import annotations
-
 import os
 import math
-import httpx
 from typing import Optional, Literal, Dict, Any
+from datetime import datetime, timedelta, timezone
 
+import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
 
-# ---------------------------------------------------------------------
-# Config & helpers
-# ---------------------------------------------------------------------
+APP_NAME = "xau-scanner"
+APP_VERSION = "2025-09-09.1"
 
-TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
-if not TWELVEDATA_API_KEY:
-    # ไม่หยุดแอป แต่จะแจ้งเตือนเวลาถูกเรียกใช้งาน
-    print("[WARN] TWELVEDATA_API_KEY is not set. /signal will fail without it.")
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 
-# แปลงชื่อ TF ที่ UI ใช้ -> interval ของ TwelveData
-INTERVAL_MAP = {
-    "M1": "1min",
-    "M5": "5min",
-    "M15": "15min",
-    "M30": "30min",
-    "H1": "1h",
-    "H2": "2h",
-    "H4": "4h",
-    "D1": "1day",
-}
+app = FastAPI(title="XAU Scanner", version=APP_VERSION)
 
-def tf_to_interval(tf: str) -> str:
-    tf = tf.upper()
-    if tf not in INTERVAL_MAP:
-        raise HTTPException(status_code=400, detail=f"Unsupported TF: {tf}")
-    return INTERVAL_MAP[tf]
-
-def as_float(x: Any, default: float = 0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-# ---------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------
-
-app = FastAPI(title="XAU Scanner", version="2025-09-07.2")
-
-# CORS
-_allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
-if _allowed_origins_env:
-    # คั่นด้วย , หรือ ช่องว่าง ก็ได้
-    _origins = [o.strip() for part in _allowed_origins_env.split(",") for o in part.split()]
-else:
-    _origins = ["*"]  # เปิดกว้างถ้ายังไม่ตั้งค่า
-
+# ---- CORS ----
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_origins,
+    allow_origins=[ALLOWED_ORIGINS] if ALLOWED_ORIGINS and ALLOWED_ORIGINS != "*" else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------
+# ---- Timeframe map for TwelveData ----
+TF_MAP = {
+    "M5": "5min",
+    "M15": "15min",
+    "H1": "1h",
+    "H4": "4h",
+    "D1": "1day",
+}
 
+# -------- Models --------
 class SignalRequest(BaseModel):
-    symbol: str = Field(..., example="XAU/USD")
-    higher_tf: str = Field(..., example="H4")
-    lower_tf: str = Field(..., example="M15")
-    sl_points: int = Field(250, ge=1)
-    tp1_points: int = Field(500, ge=1)
-    tp2_points: int = Field(1000, ge=1)
+    symbol: str = Field(..., examples=["XAU/USD", "XAUUSD"])
+    higher_tf: Literal["H1", "H4", "D1"]
+    lower_tf: Literal["M5", "M15"]
+    sl_points: int = 250
+    tp1_points: int = 500
+    tp2_points: int = 1000
 
-    @validator("symbol")
-    def v_symbol(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("symbol is empty")
-        return v
+    # Optional: ใช้กรอบเอง (จะไม่ไปเรียก TwelveData)
+    box_high: Optional[float] = None
+    box_low: Optional[float] = None
 
-class RefBox(BaseModel):
-    higher_tf: str
-    lower_tf: str
-    H_high: float
-    H_low: float
-    last: float
-    box_height: float
 
-class SignalResponse(BaseModel):
-    status: Literal["OK", "WATCH", "ENTRY", "ERROR"]
-    signal: Literal["NONE", "LONG", "SHORT"]
-    reason: str
-    entry: Optional[float] = None
-    sl: Optional[float] = None
-    tp1: Optional[float] = None
-    tp2: Optional[float] = None
-    ref: Optional[RefBox] = None
-    backend: str = "xau-scanner"
-    version: str = app.version
+# -------- Utilities --------
+def norm_symbol(sym: str) -> str:
+    # TwelveData ใช้ "XAU/USD" แนะนำให้ใช้สตริงนี้
+    s = sym.upper().replace("XAUUSD", "XAU/USD").replace("XAU XUSD", "XAU/USD")
+    return s
 
-# ---------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------
+def td_url(path: str, params: Dict[str, Any]) -> str:
+    base = "https://api.twelvedata.com"
+    q = "&".join([f"{k}={requests.utils.quote(str(v))}" for k, v in params.items()])
+    return f"{base}{path}?{q}"
 
-@app.get("/")
-def root():
-    return {"app": "xau-scanner", "version": app.version, "ok": True}
+def fetch_candles(symbol: str, interval: str, outputsize: int = 60) -> Dict[str, Any]:
+    """ดึง OHLC ล่าสุดจาก TwelveData (คืน dict: meta, values(list))"""
+    if not TWELVEDATA_API_KEY:
+        raise HTTPException(500, detail="TWELVEDATA_API_KEY not set")
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-# ---------------------------------------------------------------------
-# TwelveData fetchers
-# ---------------------------------------------------------------------
-
-BASE_URL = "https://api.twelvedata.com"
-
-async def fetch_latest_closed_candle(
-    client: httpx.AsyncClient, symbol: str, interval: str
-) -> Dict[str, Any]:
-    """
-    ดึงแท่งเทียน 'ปิดแล้ว' ล่าสุด 2 แท่ง และใช้แท่ง [-2] เป็น "ล่าสุดที่ปิดแล้วจริง"
-    (กันกรณีแท่ง[-1] ยังวิ่งอยู่ในช่วงเวลาปัจจุบัน)
-    """
-    url = f"{BASE_URL}/time_series"
     params = {
         "symbol": symbol,
         "interval": interval,
-        "outputsize": 2,       # พอสำหรับดึง -2 เป็นแท่งปิดล่าสุด
-        "order": "desc",
+        "outputsize": outputsize,
+        "timezone": "UTC",
         "apikey": TWELVEDATA_API_KEY,
     }
-    r = await client.get(url, params=params, timeout=20)
-    r.raise_for_status()
+    url = td_url("/time_series", params)
+    r = requests.get(url, timeout=15)
+    if r.status_code != 200:
+        raise HTTPException(502, detail=f"TwelveData {r.status_code}")
     data = r.json()
+    if "status" in data and data.get("status") == "error":
+        raise HTTPException(502, detail=f"TwelveData error: {data.get('message')}")
+    if "values" not in data or not data["values"]:
+        raise HTTPException(502, detail="TwelveData no data")
+    return data
 
-    if "values" not in data or not isinstance(data["values"], list) or len(data["values"]) < 2:
-        raise HTTPException(status_code=502, detail=f"Not enough data for {symbol} {interval}")
+def latest_close(data: Dict[str, Any]) -> float:
+    # values[0] คือแท่งล่าสุด (close เป็น string)
+    try:
+        return float(data["values"][0]["close"])
+    except Exception:
+        raise HTTPException(500, detail="Malformed TwelveData response")
 
-    # values เรียงจากใหม่ -> เก่า
-    # [-1] = เก่าสุด, [0] = ยังวิ่ง, [1] = ปิดล่าสุด
-    closed = data["values"][1]
-    # normalize
-    return {
-        "datetime": closed.get("datetime"),
-        "open": as_float(closed.get("open")),
-        "high": as_float(closed.get("high")),
-        "low": as_float(closed.get("low")),
-        "close": as_float(closed.get("close")),
-    }
+def recent_high_low(data: Dict[str, Any], bars: int = 20) -> (float, float):
+    """คำนวนกรอบ: high สูงสุดและ low ต่ำสุด ของช่วงล่าสุด bars แท่ง (TF สูง)"""
+    vals = data["values"][:bars]
+    highs = [float(v["high"]) for v in vals]
+    lows = [float(v["low"]) for v in vals]
+    return max(highs), min(lows)
 
-async def fetch_last_close(
-    client: httpx.AsyncClient, symbol: str, interval: str
-) -> float:
-    """
-    close ล่าสุดที่ 'ปิดแล้ว' บน TF ต่ำ
-    """
-    c = await fetch_latest_closed_candle(client, symbol, interval)
-    return as_float(c["close"])
-
-# ---------------------------------------------------------------------
-# Break + Close logic
-# ---------------------------------------------------------------------
-
-def compute_trade_levels(
-    direction: Literal["LONG", "SHORT"],
-    entry: float,
-    sl_points: int,
-    tp1_points: int,
-    tp2_points: int,
-) -> Dict[str, float]:
-    if direction == "LONG":
-        sl = entry - sl_points
-        tp1 = entry + tp1_points
-        tp2 = entry + tp2_points
-    else:  # SHORT
-        sl = entry + sl_points
-        tp1 = entry - tp1_points
-        tp2 = entry - tp2_points
-    return {"sl": sl, "tp1": tp1, "tp2": tp2}
-
-@app.post("/signal", response_model=SignalResponse)
-async def signal(req: SignalRequest):
-    if not TWELVEDATA_API_KEY:
-        raise HTTPException(status_code=500, detail="TWELVEDATA_API_KEY is not configured on server")
-
-    higher_iv = tf_to_interval(req.higher_tf)
-    lower_iv = tf_to_interval(req.lower_tf)
-
-    # ดึงข้อมูล
-    async with httpx.AsyncClient() as client:
-        # กล่อง (กรอบ) ใช้แท่ง TF สูงที่ "ปิดล่าสุด"
-        H = await fetch_latest_closed_candle(client, req.symbol, higher_iv)
-        H_high = as_float(H["high"])
-        H_low = as_float(H["low"])
-
-        # ราคา close ล่าสุด (ปิดแล้ว) บน TF ต่ำ
-        last_close = await fetch_last_close(client, req.symbol, lower_iv)
-
-    box_height = max(H_high - H_low, 0.0)
-
-    # ตรวจ Break + Close
-    entry_dir: Literal["LONG", "SHORT"] = "LONG"
-    decide = "WATCH"
-
-    if last_close > H_high:
-        decide = "ENTRY"
-        entry_dir = "LONG"
-    elif last_close < H_low:
-        decide = "ENTRY"
-        entry_dir = "SHORT"
+def calc_entry_setups(side: Literal["LONG","SHORT"], entry: float, sl_pts: int, tp1_pts: int, tp2_pts: int):
+    if side == "LONG":
+        sl = entry - sl_pts
+        tp1 = entry + tp1_pts
+        tp2 = entry + tp2_pts
     else:
-        decide = "WATCH"
+        sl = entry + sl_pts
+        tp1 = entry - tp1_pts
+        tp2 = entry - tp2_pts
+    return sl, tp1, tp2
 
-    if decide == "WATCH":
-        return SignalResponse(
-            status="WATCH",
-            signal="NONE",
-            reason=f"ยังไม่ Breakout โซน {req.higher_tf}/{req.lower_tf}",
-            ref=RefBox(
-                higher_tf=req.higher_tf,
-                lower_tf=req.lower_tf,
-                H_high=H_high,
-                H_low=H_low,
-                last=last_close,
-                box_height=box_height,
-            ),
-        )
 
-    # ENTRY
-    levels = compute_trade_levels(
-        direction=entry_dir,
-        entry=last_close,
-        sl_points=req.sl_points,
-        tp1_points=req.tp1_points,
-        tp2_points=req.tp2_points,
-    )
+# -------- Routes --------
+@app.get("/")
+def root():
+    return {"app": APP_NAME, "version": APP_VERSION, "ok": True}
 
-    # ข้อความสรุป
-    msg = (
-        f"ENTRY {entry_dir} @ {last_close:.2f} | "
-        f"SL {levels['sl']:.2f} | TP1 {levels['tp1']:.2f} | TP2 {levels['tp2']:.2f}"
-    )
+@app.get("/health")
+def health():
+    return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
 
-    return SignalResponse(
-        status="ENTRY",
-        signal=entry_dir,
-        reason=msg,
-        entry=last_close,
-        sl=levels["sl"],
-        tp1=levels["tp1"],
-        tp2=levels["tp2"],
-        ref=RefBox(
-            higher_tf=req.higher_tf,
-            lower_tf=req.lower_tf,
-            H_high=H_high,
-            H_low=H_low,
-            last=last_close,
-            box_height=box_height,
-        ),
-    )
+@app.post("/signal")
+def signal(req: SignalRequest):
+    symbol = norm_symbol(req.symbol)
+    hi_tf = req.higher_tf
+    lo_tf = req.lower_tf
+
+    # 1) กำหนดกรอบ (box) : ใช้ค่าที่ผู้ใช้ส่งมา หรือคำนวนจาก TwelveData
+    if req.box_high is not None and req.box_low is not None:
+        box_high, box_low = float(req.box_high), float(req.box_low)
+        box_source = "manual"
+    else:
+        # ใช้ TwelveData หา high/low จาก TF สูง (ช่วง N แท่งหลังสุด)
+        if hi_tf not in TF_MAP:
+            raise HTTPException(400, detail="Invalid higher_tf")
+        hi_data = fetch_candles(symbol, TF_MAP[hi_tf], outputsize=120)
+        # กรอบจาก 20 แท่งหลังสุด (ปรับได้)
+        box_high, box_low = recent_high_low(hi_data, bars=20)
+        box_source = "twelvedata"
+
+    if lo_tf not in TF_MAP:
+        raise HTTPException(400, detail="Invalid lower_tf")
+    lo_data = fetch_candles(symbol, TF_MAP[lo_tf], outputsize=5)
+    lo_close = latest_close(lo_data)
+
+    # 2) Logic: Break + Close (เข้าเมื่อ "แท่งปิด" ทะลุกกรอบทันที)
+    status = "WATCH"
+    side: Optional[Literal["LONG","SHORT"]] = None
+    reason = "ยังไม่ Breakout"
+    entry: Optional[float] = None
+
+    if lo_close > box_high:
+        status = "ENTRY"
+        side = "LONG"
+        reason = f"Break+Close above {hi_tf} box."
+        entry = lo_close
+    elif lo_close < box_low:
+        status = "ENTRY"
+        side = "SHORT"
+        reason = f"Break+Close below {hi_tf} box."
+        entry = lo_close
+
+    # 3) สร้าง SL/TP (เฉพาะกรณี ENTRY)
+    sl = tp1 = tp2 = None
+    if status == "ENTRY" and side and entry is not None:
+        sl, tp1, tp2 = calc_entry_setups(side, entry, req.sl_points, req.tp1_points, req.tp2_points)
+
+    return {
+        "status": status,
+        "side": side,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "reason": reason,
+        "box": {"high": box_high, "low": box_low, "tf": hi_tf, "source": box_source},
+        "lower_tf_close": lo_close,
+        "params": {"sl_points": req.sl_points, "tp1_points": req.tp1_points, "tp2_points": req.tp2_points},
+        "meta": {"symbol": symbol, "higher_tf": hi_tf, "lower_tf": lo_tf, "version": APP_VERSION},
+    }
