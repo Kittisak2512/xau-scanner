@@ -1,16 +1,17 @@
+# --- bootstrap tools (ช่วยให้ build ผ่าน) ---
+pip==24.2
+setuptools<70
+wheel
+
+# --- web api ---
 fastapi==0.110.0
-uvicorn==0.27.0.post1
-
-# สำหรับคำนวณ/สัญญาณ
-pandas==2.2.2
-numpy==1.26.4
-
-# เรียก TwelveData / HTTP
-requests==2.31.0
-
-# สำหรับอัพโหลดไฟล์ (FastAPI ต้องใช้)
+uvicorn==0.29.0
 python-multipart==0.0.9
 
-# ตัวช่วย build บน Render (สำคัญที่สุด)
-setuptools==68.2.2
-wheel==0.41.2
+# --- utils ---
+requests==2.31.0
+python-dotenv==1.0.1
+
+# --- data / calc (ระวังเวอร์ชัน เพื่อเลี่ยง build หนัก) ---
+pandas==2.2.2
+numpy==1.26.4
