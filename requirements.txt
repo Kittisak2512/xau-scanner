@@ -1,5 +1,4 @@
-fastapi
-uvicorn[standard]
-requests
-pydantic
-python-multipart
+fastapi==0.111.0
+uvicorn==0.30.1
+pydantic==2.9.1
+requests==2.32.3
