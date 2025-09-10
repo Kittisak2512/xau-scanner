@@ -1,18 +1,17 @@
-# main.py
 import os
 from datetime import datetime, timezone
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 APP_VERSION = "2025-09-10.2"
 
-# =========================
-# Environment Config
-# =========================
+# =====================
+# Environment / Config
+# =====================
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 
 _ALLOWED = os.getenv("ALLOWED_ORIGINS", "*").strip()
@@ -21,15 +20,10 @@ if _ALLOWED in ("", "*"):
 else:
     ALLOW_ORIGINS = [o.strip() for o in _ALLOWED.split(",") if o.strip()]
 
-# Points (ปรับได้ผ่าน ENV หากต้องการ)
-SL_POINTS = float(os.getenv("SL_POINTS", "250"))
-TP1_POINTS = float(os.getenv("TP1_POINTS", "500"))
-TP2_POINTS = float(os.getenv("TP2_POINTS", "1000"))
-
-# =========================
-# FastAPI
-# =========================
-app = FastAPI(title="xau-scanner", version=APP_VERSION)
+# =====================
+# FastAPI app
+# =====================
+app = FastAPI(title="xau-scanner")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,31 +33,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================
+# =====================
 # Models
-# =========================
-class SignalRequest(BaseModel):
-    symbol: str = Field(..., examples=["XAU/USD"])
-    tf_high: str = Field(..., description="High timeframe (H1 or H4)", examples=["H1", "H4"])
-    tf_low: str = Field(..., description="Low timeframe (M5 or M15)", examples=["M5", "M15"])
-
-    @field_validator("tf_high")
-    @classmethod
-    def _chk_high(cls, v: str) -> str:
-        v = v.upper()
-        if v not in {"H1", "H4"}:
-            raise ValueError("tf_high must be H1 or H4")
-        return v
-
-    @field_validator("tf_low")
-    @classmethod
-    def _chk_low(cls, v: str) -> str:
-        v = v.upper()
-        if v not in {"M5", "M15"}:
-            raise ValueError("tf_low must be M5 or M15")
-        return v
-
-
+# =====================
 class Candle(BaseModel):
     dt: str
     open: float
@@ -72,25 +44,54 @@ class Candle(BaseModel):
     close: float
 
 
-# =========================
+class SignalRequest(BaseModel):
+    # รุ่นใหม่จากหน้าเว็บ: ส่ง symbol, tf_high, tf_low
+    # รุ่นเก่าบางหน้าส่ง: symbol, tf  (ถือเป็น tf_low)
+    symbol: str
+    tf_high: Optional[str] = None
+    tf_low: Optional[str] = None
+    tf: Optional[str] = None  # backward-compat
+
+    @model_validator(mode="after")
+    def normalize(self) -> "SignalRequest":
+        # แปลง tf -> tf_low (รองรับ client เก่า)
+        if not self.tf_low and self.tf:
+            self.tf_low = self.tf
+
+        # ค่าเริ่มต้นอัตโนมัติ: ถ้าไม่ส่ง tf_high มา
+        # - M5 -> ใช้ H1 เป็นกรอบ
+        # - M15 -> ใช้ H4 เป็นกรอบ
+        if self.tf_low:
+            tl = self.tf_low.upper()
+            if tl not in {"M5", "M15"}:
+                raise ValueError("tf_low must be M5 or M15")
+            if not self.tf_high:
+                self.tf_high = "H1" if tl == "M5" else "H4"
+
+        if not self.tf_low:
+            raise ValueError("tf_low (or tf) is required.")
+        if not self.tf_high:
+            raise ValueError("tf_high is required.")
+
+        self.tf_low = self.tf_low.upper()
+        self.tf_high = self.tf_high.upper()
+        if self.tf_high not in {"H1", "H4"}:
+            raise ValueError("tf_high must be H1 or H4")
+        return self
+
+
+# =====================
 # Utilities
-# =========================
+# =====================
 def td_interval(tf: str) -> str:
-    """Map timeframe to TwelveData interval string."""
-    tf = tf.upper()
-    mapping = {
-        "M5": "5min",
-        "M15": "15min",
-        "H1": "1h",
-        "H4": "4h",
-    }
-    if tf not in mapping:
+    m = tf.upper()
+    mapping = {"M5": "5min", "M15": "15min", "H1": "1h", "H4": "4h"}
+    if m not in mapping:
         raise ValueError(f"Unsupported TF: {tf}")
-    return mapping[tf]
+    return mapping[m]
 
 
-def fetch_series(symbol: str, tf: str, size: int = 120) -> List[Candle]:
-    """Fetch time series (latest first) from TwelveData."""
+def fetch_series(symbol: str, tf: str, size: int) -> List[Candle]:
     if not TWELVEDATA_API_KEY:
         raise HTTPException(status_code=500, detail="Missing TWELVEDATA_API_KEY")
 
@@ -99,29 +100,28 @@ def fetch_series(symbol: str, tf: str, size: int = 120) -> List[Candle]:
         "symbol": symbol,
         "interval": td_interval(tf),
         "outputsize": size,
-        "order": "desc",          # latest first
+        "order": "desc",
         "timezone": "UTC",
         "apikey": TWELVEDATA_API_KEY,
     }
+    r = requests.get(url, params=params, timeout=20)
     try:
-        r = requests.get(url, params=params, timeout=20)
         data = r.json()
     except Exception:
-        raise HTTPException(status_code=502, detail="Upstream returned non-JSON.")
+        raise HTTPException(status_code=502, detail="Upstream returned non-JSON")
 
     if isinstance(data, dict) and data.get("status") == "error":
         raise HTTPException(status_code=502, detail=str(data.get("message", "API error")))
-
     values = data.get("values")
     if not values:
-        raise HTTPException(status_code=502, detail="No data from TwelveData.")
+        raise HTTPException(status_code=502, detail="No data from TwelveData")
 
-    candles: List[Candle] = []
+    out: List[Candle] = []
     for v in values:
         try:
-            candles.append(
+            out.append(
                 Candle(
-                    dt=str(v["datetime"]),
+                    dt=v["datetime"],
                     open=float(v["open"]),
                     high=float(v["high"]),
                     low=float(v["low"]),
@@ -129,16 +129,13 @@ def fetch_series(symbol: str, tf: str, size: int = 120) -> List[Candle]:
                 )
             )
         except Exception:
-            # skip bad row
             continue
+    if not out:
+        raise HTTPException(status_code=502, detail="Cannot parse bars")
+    return out  # latest first (desc)
 
-    if not candles:
-        raise HTTPException(status_code=502, detail="Cannot parse bars.")
-    return candles  # latest first
 
-
-def previous_closed(candles: List[Candle]) -> Candle:
-    """TwelveData (order=desc) index 0 is latest closed bar."""
+def last_closed(candles: List[Candle]) -> Candle:
     return candles[0]
 
 
@@ -154,39 +151,50 @@ def near(value: float, target: float, tolerance_points: float) -> bool:
     return abs(value - target) <= tolerance_points
 
 
-# =========================
-# Core Logic
-# =========================
+# =====================
+# Core
+# =====================
 def analyze_breakout(symbol: str, tf_high: str, tf_low: str) -> Dict[str, Any]:
     """
     กติกา:
-      1) เอาแท่งปิดล่าสุดของ TF สูง (H1/H4) มาตีกรอบ: upper=high, lower=low
-      2) อ่าน TF ต่ำ (M5/M15) ล่าสุด 30 แท่ง → เช็ค breakout ด้วย close cross
-      3) หากเพิ่งเบรก:
-           - signal = BREAKOUT_LONG/SHORT
-           - ถ้าราคารีเทสใกล้เส้น (<= max(100, 50% body แท่งเบรก)) → ENTRY_READY_*
-           - entry = เส้นกรอบ, sl/tp = ตามค่าจุดที่กำหนด
-      4) ไม่เบรก → WAIT
+      1) ใช้แท่งที่ 'ปิดล่าสุด' ของ TF สูง (H1/H4) เป็นกรอบ: upper=high, lower=low
+      2) เฝ้า TF ต่ำ (M5/M15) ตรวจ breakout (อนุโลมภายใน 2–3 แท่งล่าสุด)
+      3) ถ้า breakout:
+            - entry  : เส้นกรอบที่ถูกเบรก
+            - entry_50: ใกล้กรอบ 50% ของช่วงกรอบ (เผื่อรีเทสต์ลึก)
+            - SL     : 250 จุด
+            - TP1/TP2: 500 / 1000 จุด
     """
-    # --- High TF box ---
-    high_bars = fetch_series(symbol, tf_high, size=10)
-    high_ref = previous_closed(high_bars)  # ใช้แท่งปิดล่าสุดของ TF สูง
-    upper = float(high_ref.high)
-    lower = float(high_ref.low)
+    # --- High TF box from last closed bar ---
+    hi_bar = last_closed(fetch_series(symbol, tf_high, 6))
+    upper = hi_bar.high
+    lower = hi_bar.low
 
-    # --- Low TF bars ---
-    low_bars = fetch_series(symbol, tf_low, size=30)
-    if len(low_bars) < 2:
+    # --- Low TF recent bars ---
+    low_bars = fetch_series(symbol, tf_low, 12)  # ~ 2–3 แท่งล่าสุดพอ
+    if len(low_bars) < 3:
         return {"status": "ERROR", "message": "Not enough low timeframe data."}
 
-    last = low_bars[0]
-    prev = low_bars[1]
+    last_b = low_bars[0]
+    prev_b = low_bars[1]
+    prev2_b = low_bars[2]
 
-    up_break = crossed_above(prev.close, last.close, upper)
-    dn_break = crossed_below(prev.close, last.close, lower)
+    # breakout detection (ยอมรับภายใน 3 แท่งล่าสุด)
+    up_now = crossed_above(prev_b.close, last_b.close, upper)
+    dn_now = crossed_below(prev_b.close, last_b.close, lower)
 
-    # โครงผลลัพธ์พื้นฐาน
-    result: Dict[str, Any] = {
+    up_prev = crossed_above(prev2_b.close, prev_b.close, upper)
+    dn_prev = crossed_below(prev2_b.close, prev_b.close, lower)
+
+    up_break = up_now or up_prev
+    dn_break = dn_now or dn_prev
+
+    # default outputs
+    sl_points = 250.0
+    tp1_points = 500.0
+    tp2_points = 1000.0
+
+    res: Dict[str, Any] = {
         "status": "OK",
         "symbol": symbol,
         "tf_high": tf_high,
@@ -194,17 +202,11 @@ def analyze_breakout(symbol: str, tf_high: str, tf_low: str) -> Dict[str, Any]:
         "box": {
             "upper": round(upper, 2),
             "lower": round(lower, 2),
-            "ref_bar": {
-                "dt": high_ref.dt,
-                "open": high_ref.open,
-                "high": high_ref.high,
-                "low": high_ref.low,
-                "close": high_ref.close,
-            },
+            "ref_bar": hi_bar.model_dump(),
         },
         "overlay": {
-            "last": last.model_dump(),
-            "prev": prev.model_dump(),
+            "last": last_b.model_dump(),
+            "prev": prev_b.model_dump(),
         },
         "signal": None,
         "entry": None,
@@ -215,52 +217,58 @@ def analyze_breakout(symbol: str, tf_high: str, tf_low: str) -> Dict[str, Any]:
         "message": "",
     }
 
-    # tolerance สำหรับรีเทส
-    body = abs(last.close - prev.close)
-    retest_tol = max(100.0, 0.5 * body)
+    # tolerance for retest (max 100 points or half body of latest bar)
+    body = abs(last_b.close - prev_b.close)
+    tol = max(100.0, 0.5 * body)
 
-    # ===== Breakout ขึ้น =====
+    # ========== LONG ==========
     if up_break:
         entry = upper
-        result["entry"] = round(entry, 2)
-        result["entry_50"] = round(entry - 0.5 * (entry - prev.close), 2)  # เข้าเพิ่มเผื่อย่อ 50%
-        result["sl"] = round(entry - SL_POINTS, 2)
-        result["tp1"] = round(entry + TP1_POINTS, 2)
-        result["tp2"] = round(entry + TP2_POINTS, 2)
+        mid = lower + (upper - lower) * 0.5  # จุด 50% ในกรอบ
+        entry50 = (entry + mid) / 2.0        # ยอมให้ลึกถึงกึ่งระหว่าง entry กับกรอบกลาง
 
-        if near(last.close, entry, retest_tol):
-            result["signal"] = "ENTRY_READY_LONG"
-            result["message"] = "Retest ใกล้เส้นกรอบบนหลังเบรก — พร้อมเข้า Long."
+        if near(last_b.close, entry, tol) or near(last_b.close, entry50, tol):
+            res["signal"] = "ENTRY_LONG"
+            res["message"] = "Breakout ขึ้นแล้ว ราคากำลัง/เพิ่งรีเทสต์กรอบบน"
         else:
-            result["signal"] = "BREAKOUT_LONG"
-            result["message"] = "เบรกกรอบบนแล้ว — รอย่อกลับมาใกล้เส้นกรอบค่อยเข้า Long."
-        return result
+            res["signal"] = "BREAKOUT_LONG_WAIT_RETEST"
+            res["message"] = "Breakout ขึ้น กำลังรอราคารีเทสต์กรอบ"
 
-    # ===== Breakout ลง =====
+        res["entry"] = round(entry, 2)
+        res["entry_50"] = round(entry50, 2)
+        res["sl"] = round(entry - sl_points, 2)
+        res["tp1"] = round(entry + tp1_points, 2)
+        res["tp2"] = round(entry + tp2_points, 2)
+        return res
+
+    # ========== SHORT ==========
     if dn_break:
         entry = lower
-        result["entry"] = round(entry, 2)
-        result["entry_50"] = round(entry + 0.5 * (prev.close - entry), 2)  # เด้ง 50% ค่อยยิงต่อ
-        result["sl"] = round(entry + SL_POINTS, 2)
-        result["tp1"] = round(entry - TP1_POINTS, 2)
-        result["tp2"] = round(entry - TP2_POINTS, 2)
+        mid = lower + (upper - lower) * 0.5
+        entry50 = (entry + mid) / 2.0
 
-        if near(last.close, entry, retest_tol):
-            result["signal"] = "ENTRY_READY_SHORT"
-            result["message"] = "Retest ใกล้เส้นกรอบล่างหลังเบรก — พร้อมเข้า Short."
+        if near(last_b.close, entry, tol) or near(last_b.close, entry50, tol):
+            res["signal"] = "ENTRY_SHORT"
+            res["message"] = "Breakout ลงแล้ว ราคากำลัง/เพิ่งรีเทสต์กรอบล่าง"
         else:
-            result["signal"] = "BREAKOUT_SHORT"
-            result["message"] = "เบรกกรอบล่างแล้ว — รอเด้งกลับมาใกล้เส้นกรอบค่อยเข้า Short."
-        return result
+            res["signal"] = "BREAKOUT_SHORT_WAIT_RETEST"
+            res["message"] = "Breakout ลง กำลังรอราคารีเทสต์กรอบ"
 
-    # ===== ยังไม่เบรก =====
-    result["message"] = "WAIT — รอราคาเบรกกรอบบน/ล่าง (ที่ TF ต่ำ)."
-    return result
+        res["entry"] = round(entry, 2)
+        res["entry_50"] = round(entry50, 2)
+        res["sl"] = round(entry + sl_points, 2)
+        res["tp1"] = round(entry - tp1_points, 2)
+        res["tp2"] = round(entry - tp2_points, 2)
+        return res
+
+    # ========== WAIT ==========
+    res["message"] = "WAIT — รอราคาเบรกกรอบบน/ล่าง (ที่ TF ต่ำ)."
+    return res
 
 
-# =========================
+# =====================
 # Routes
-# =========================
+# =====================
 @app.get("/")
 def root():
     return {"app": "xau-scanner", "version": APP_VERSION, "ok": True}
@@ -268,11 +276,23 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
+    return {"ok": True, "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
 
 
+# รุ่นเก่า: /signal (body อาจส่ง tf หรือ tf_low)
 @app.post("/signal")
 def signal(req: SignalRequest):
+    try:
+        return analyze_breakout(req.symbol, req.tf_high, req.tf_low)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ใหม่ให้ตรงกับปุ่มหน้าเว็บ: /breakout
+@app.post("/breakout")
+def breakout(req: SignalRequest):
     try:
         return analyze_breakout(req.symbol, req.tf_high, req.tf_low)
     except HTTPException:
