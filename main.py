@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-APP_VERSION = "2025-09-10.1"
+APP_VERSION = "2025-09-10.2-flex"
 
 # =========================
 # Environment & CORS
@@ -138,7 +138,7 @@ def near(value: float, target: float, tolerance_points: float) -> bool:
 
 
 # =========================
-# Core Logic (แบบเดิม)
+# Core Logic (แบบเดิม /signal)
 # =========================
 def analyze_signal(symbol: str, low_tf: str) -> Dict[str, Any]:
     """
@@ -222,27 +222,33 @@ def analyze_signal(symbol: str, low_tf: str) -> Dict[str, Any]:
 
 
 # =========================
-# Core Logic (แบบใหม่ /breakout)
+# Core Logic (แบบใหม่ /breakout - FLEX)
 # =========================
 def analyze_breakout(symbol: str, tf_high: str, tf_low: str) -> Dict[str, Any]:
     """
-    Logic ใหม่ตามที่คุยกัน:
-      - ใช้ tf_high (H1/H4) หา 'กรอบ' จาก high/low ของแท่งปิดล่าสุด
-      - จับตา tf_low (M5/M15) แล้วให้สัญญาณเมื่อเบรกกรอบ + เงื่อนไขรีเทสต์
-      - ให้ entry หลัก = เส้นกรอบ, entry_50 = จุดย้อนกลับ 50% ของแท่งเบรก
-      - SL/TP ใช้ 250/500/1000 จุด
+    Breakout ยืดหยุ่น:
+      - wick breakout (high/low ทะลุกรอบ + buffer)
+      - close breakout (close ทะลุกรอบ + buffer)
+      - close cross สองแท่ง (แบบเดิม) + epsilon
+      - รีเทสต์แล้วให้ ENTRY_READY_*
     """
+    # --- สร้างกรอบจาก tf_high ---
     ref = previous_closed(fetch_series(symbol, tf_high, 50))
     upper = ref.high
     lower = ref.low
 
+    # --- แท่ง tf_low ล่าสุด ---
     bars = fetch_series(symbol, tf_low, 30)
     if len(bars) < 2:
         return {"status": "ERROR", "message": "Not enough low timeframe data."}
     last, prev = bars[0], bars[1]
 
+    # พารามิเตอร์
     sl_points, tp1_points, tp2_points = 250.0, 500.0, 1000.0
+    buffer_points = 10.0   # ปรับได้ 5–20 ตามโบรก/สเปรด/ความไว
+    eps = 1e-6             # กันเท่ากันเป๊ะ ๆ
 
+    # โครงผลลัพธ์
     res: Dict[str, Any] = {
         "status": "OK",
         "symbol": symbol,
@@ -266,43 +272,63 @@ def analyze_breakout(symbol: str, tf_high: str, tf_low: str) -> Dict[str, Any]:
         "message": "",
     }
 
-    up = crossed_above(prev.close, last.close, upper)
-    dn = crossed_below(prev.close, last.close, lower)
+    # ---------- เงื่อนไข breakout ทั้ง 3 ชั้น ----------
+    wick_up  = last.high >= upper + buffer_points - eps
+    wick_dn  = last.low  <= lower - buffer_points + eps
 
-    if up:
+    close_up = last.close >= upper + buffer_points - eps
+    close_dn = last.close <= lower - buffer_points + eps
+
+    cross_up = (prev.close <= upper + eps) and (last.close >= upper + eps)
+    cross_dn = (prev.close >= lower - eps) and (last.close <= lower - eps)
+
+    # รวมเงื่อนไข
+    up_break = wick_up or close_up or cross_up
+    dn_break = wick_dn or close_dn or cross_dn
+
+    # ฟังก์ชันช่วยคำนวณผลลัพธ์
+    def pack_long(entry_level: float) -> Dict[str, Any]:
         body = abs(last.close - prev.close)
-        entry = upper
         tol = max(100.0, 0.5 * body)
-        res["entry"] = round(entry, 2)
-        res["entry_50"] = round(entry - 0.5 * body, 2)
-        res["sl"] = round(entry - sl_points, 2)
-        res["tp1"] = round(entry + tp1_points, 2)
-        res["tp2"] = round(entry + tp2_points, 2)
-        if near(last.close, entry, tol):
-            res["signal"] = "ENTRY_READY_LONG"
-            res["message"] = "Retest กลับเหนือกรอบบนหลังเบรก"
+        result = res.copy()
+        result["entry"] = round(entry_level, 2)
+        result["entry_50"] = round(entry_level - 0.5 * body, 2)
+        result["sl"] = round(entry_level - sl_points, 2)
+        result["tp1"] = round(entry_level + tp1_points, 2)
+        result["tp2"] = round(entry_level + tp2_points, 2)
+        if near(last.close, entry_level, tol):
+            result["signal"] = "ENTRY_READY_LONG"
+            result["message"] = "Retest เหนือกรอบบนหลังเบรก – เข้าได้"
         else:
-            res["signal"] = "BREAKOUT_LONG"
-            res["message"] = "เบรกกรอบบน รอรีเทสแล้วค่อยเข้า"
-        return res
+            result["signal"] = "BREAKOUT_LONG"
+            result["message"] = "เบรกกรอบบนแล้ว – รอรีเทสต์เพื่อเข้า"
+        return result
 
-    if dn:
+    def pack_short(entry_level: float) -> Dict[str, Any]:
         body = abs(last.close - prev.close)
-        entry = lower
         tol = max(100.0, 0.5 * body)
-        res["entry"] = round(entry, 2)
-        res["entry_50"] = round(entry + 0.5 * body, 2)
-        res["sl"] = round(entry + sl_points, 2)
-        res["tp1"] = round(entry - tp1_points, 2)
-        res["tp2"] = round(entry - tp2_points, 2)
-        if near(last.close, entry, tol):
-            res["signal"] = "ENTRY_READY_SHORT"
-            res["message"] = "Retest กลับใต้กรอบล่างหลังเบรก"
+        result = res.copy()
+        result["entry"] = round(entry_level, 2)
+        result["entry_50"] = round(entry_level + 0.5 * body, 2)
+        result["sl"] = round(entry_level + sl_points, 2)
+        result["tp1"] = round(entry_level - tp1_points, 2)
+        result["tp2"] = round(entry_level - tp2_points, 2)
+        if near(last.close, entry_level, tol):
+            result["signal"] = "ENTRY_READY_SHORT"
+            result["message"] = "Retest ใต้กรอบล่างหลังเบรก – เข้าได้"
         else:
-            res["signal"] = "BREAKOUT_SHORT"
-            res["message"] = "เบรกกรอบล่าง รอรีเทสแล้วค่อยเข้า"
-        return res
+            result["signal"] = "BREAKOUT_SHORT"
+            result["message"] = "เบรกกรอบล่างแล้ว – รอรีเทสต์เพื่อเข้า"
+        return result
 
+    # ---------- ตัดสินใจ ----------
+    if up_break:
+        return pack_long(upper)
+
+    if dn_break:
+        return pack_short(lower)
+
+    # ยังไม่เบรก
     res["message"] = "WAIT — รอราคาเบรกกรอบบน/ล่าง (ที่ TF ต่ำ)."
     return res
 
@@ -336,8 +362,8 @@ def breakout(req: BreakoutRequest):
 def signal_compat(payload: Dict[str, Any]):
     """
     รองรับ:
-      {symbol, tf}                 -> วิเคราะห์แบบเดิม
-      {symbol, tf_high, tf_low}    -> วิเคราะห์แบบ breakout ใหม่
+      {symbol, tf}                 -> วิเคราะห์แบบเดิม (H1/H4 ผสม)
+      {symbol, tf_high, tf_low}    -> วิเคราะห์แบบ breakout ใหม่ (เลือก H1/H4 ตรง ๆ)
     """
     try:
         if "tf" in payload:
