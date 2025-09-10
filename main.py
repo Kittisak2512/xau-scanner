@@ -1,29 +1,28 @@
 # main.py
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Literal
 
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
-from datetime import datetime
+from pydantic import BaseModel, Field
 
 APP_VERSION = "2025-09-10.1"
 
-# ========================
-# Environment / Config
-# ========================
+# =========================
+# Environment & CORS
+# =========================
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 
-_allowed = os.getenv("ALLOWED_ORIGINS", "*").strip()
-if not _allowed or _allowed == "*":
+_ALLOWED = os.getenv("ALLOWED_ORIGINS", "*").strip()
+if _ALLOWED in ("", "*"):
     ALLOW_ORIGINS = ["*"]
 else:
-    ALLOW_ORIGINS = [o.strip() for o in _allowed.split(",") if o.strip()]
+    ALLOW_ORIGINS = [o.strip() for o in _ALLOWED.split(",") if o.strip()]
 
-# ========================
-# FastAPI App + CORS
-# ========================
+# =========================
+# FastAPI App
+# =========================
 app = FastAPI(title="xau-scanner", version=APP_VERSION)
 
 app.add_middleware(
@@ -34,20 +33,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ========================
+# =========================
 # Models
-# ========================
+# =========================
 class SignalRequest(BaseModel):
-    symbol: str = Field(..., examples=["XAU/USD"])
-    tf: str = Field(..., description="M5 or M15", examples=["M5", "M15"])
+    """รูปแบบเดิม: ใช้ TF ต่ำอันเดียว (M5/M15)"""
+    symbol: str = Field(..., examples=["XAU/USD", "XAUUSD"])
+    tf: Literal["M5", "M15"]
 
-    @field_validator("tf")
-    @classmethod
-    def check_tf(cls, v: str) -> str:
-        v = v.upper()
-        if v not in {"M5", "M15"}:
-            raise ValueError("tf must be M5 or M15")
-        return v
+
+class BreakoutRequest(BaseModel):
+    """รูปแบบใหม่: ส่ง TF สูง + TF ต่ำ"""
+    symbol: str = Field(..., examples=["XAU/USD", "XAUUSD"])
+    tf_high: Literal["H1", "H4"]
+    tf_low: Literal["M5", "M15"]
 
 
 class Candle(BaseModel):
@@ -58,9 +57,9 @@ class Candle(BaseModel):
     close: float
 
 
-# ========================
+# =========================
 # Utilities
-# ========================
+# =========================
 def td_interval(tf: str) -> str:
     m = tf.upper()
     mapping = {
@@ -75,9 +74,7 @@ def td_interval(tf: str) -> str:
 
 
 def fetch_series(symbol: str, tf: str, size: int = 120) -> List[Candle]:
-    """
-    ดึงแท่งจาก TwelveData (เรียงจากล่าสุด -> เก่าสุด)
-    """
+    """ดึงแท่งจาก TwelveData (ล่าสุดอยู่หน้าสุด / order=desc)"""
     if not TWELVEDATA_API_KEY:
         raise HTTPException(status_code=500, detail="Missing TWELVEDATA_API_KEY")
 
@@ -86,17 +83,12 @@ def fetch_series(symbol: str, tf: str, size: int = 120) -> List[Candle]:
         "symbol": symbol,
         "interval": td_interval(tf),
         "outputsize": size,
-        "order": "desc",      # ล่าสุดก่อน
+        "order": "desc",
         "timezone": "UTC",
         "apikey": TWELVEDATA_API_KEY,
     }
     try:
         r = requests.get(url, params=params, timeout=20)
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"TwelveData unreachable: {e}")
-
-    # บางครั้ง TwelveData จะส่ง HTML เมื่อ rate limit -> กันเอาไว้
-    try:
         data = r.json()
     except Exception:
         raise HTTPException(status_code=502, detail="Upstream returned non-JSON.")
@@ -107,10 +99,10 @@ def fetch_series(symbol: str, tf: str, size: int = 120) -> List[Candle]:
     if not values:
         raise HTTPException(status_code=502, detail="No data from TwelveData.")
 
-    candles: List[Candle] = []
+    out: List[Candle] = []
     for v in values:
         try:
-            candles.append(
+            out.append(
                 Candle(
                     dt=v["datetime"],
                     open=float(v["open"]),
@@ -123,18 +115,21 @@ def fetch_series(symbol: str, tf: str, size: int = 120) -> List[Candle]:
             # ข้ามแถวที่พาร์สไม่ได้
             continue
 
-    if not candles:
+    if not out:
         raise HTTPException(status_code=502, detail="Cannot parse bars.")
-    return candles  # ล่าสุดอยู่ index 0
+    return out  # ล่าสุดอยู่ index 0
+
+
+def previous_closed(candles: List[Candle]) -> Candle:
+    """ใช้แท่งปิดล่าสุด (TwelveData คืนค่ามาเป็นแท่งปิดเรียงย้อน)"""
+    return candles[0]
 
 
 def crossed_above(prev_close: float, last_close: float, level: float) -> bool:
-    # ปิดก่อนหน้า ≤ เส้น < ปิดล่าสุด
     return prev_close <= level < last_close
 
 
 def crossed_below(prev_close: float, last_close: float, level: float) -> bool:
-    # ปิดก่อนหน้า ≥ เส้น > ปิดล่าสุด
     return prev_close >= level > last_close
 
 
@@ -142,71 +137,125 @@ def near(value: float, target: float, tolerance_points: float) -> bool:
     return abs(value - target) <= tolerance_points
 
 
-# ========================
-# Core Logic
-# ========================
+# =========================
+# Core Logic (แบบเดิม)
+# =========================
 def analyze_signal(symbol: str, low_tf: str) -> Dict[str, Any]:
     """
-    จับคู่ TF ต่ำกับ TF สูง:
-      - M5  -> H1
-      - M15 -> H4
-
-    ใช้ High/Low ของแท่ง TF สูงที่ปิดล่าสุดเป็นกรอบ (upper/lower),
-    แล้วเฝ้าที่ TF ต่ำเพื่อตรวจ breakout แบบ close cross
+    เวอร์ชันเดิม:
+      1) เอา H1/H4 → resistance=max(high), support=min(low)
+      2) ดู TF ต่ำ (M5/M15) เช็คเบรกด้วย close cross
+      3) ถ้าเบรก -> สร้างสัญญาณ + entry/sl/tp
+      4) ถ้าย่อตามเงื่อนไข -> ENTRY_READY
     """
-    low_tf = low_tf.upper()
-    high_tf = "H1" if low_tf == "M5" else "H4"
+    # H1/H4 box
+    h1 = previous_closed(fetch_series(symbol, "H1", 50))
+    h4 = previous_closed(fetch_series(symbol, "H4", 50))
+    resistance = max(h1.high, h4.high)
+    support = min(h1.low, h4.low)
 
-    # --- ดึง TF สูง (แท่งล่าสุดที่ปิด = index 0) ---
-    hi_bars = fetch_series(symbol, high_tf, 50)
-    ref = hi_bars[0]  # bar อ้างอิง
+    # Low TF
+    bars = fetch_series(symbol, low_tf, 30)
+    if len(bars) < 2:
+        return {"status": "ERROR", "message": "Not enough low timeframe data."}
+    last, prev = bars[0], bars[1]
+
+    sl_points, tp1_points, tp2_points = 250.0, 500.0, 1000.0
+
+    res: Dict[str, Any] = {
+        "status": "OK",
+        "symbol": symbol,
+        "tf": low_tf,
+        "support": round(support, 2),
+        "resistance": round(resistance, 2),
+        "overlay": {
+            "h1": h1.model_dump(),
+            "h4": h4.model_dump(),
+            "last": last.model_dump(),
+            "prev": prev.model_dump(),
+        },
+        "signal": None,
+        "entry": None,
+        "sl": None,
+        "tp1": None,
+        "tp2": None,
+        "message": "",
+    }
+
+    up_break = crossed_above(prev.close, last.close, resistance)
+    dn_break = crossed_below(prev.close, last.close, support)
+
+    if up_break:
+        body = abs(last.close - prev.close)
+        entry = resistance
+        tol = max(100.0, 0.5 * body)
+        if near(last.close, entry, tol):
+            res["signal"] = "ENTRY_READY_LONG"
+            res["message"] = "Price retesting resistance after breakout."
+        else:
+            res["signal"] = "BREAKOUT_LONG"
+            res["message"] = "Breakout above resistance. Wait pullback to enter."
+        res["entry"] = round(entry, 2)
+        res["sl"] = round(entry - sl_points, 2)
+        res["tp1"] = round(entry + tp1_points, 2)
+        res["tp2"] = round(entry + tp2_points, 2)
+        return res
+
+    if dn_break:
+        body = abs(last.close - prev.close)
+        entry = support
+        tol = max(100.0, 0.5 * body)
+        if near(last.close, entry, tol):
+            res["signal"] = "ENTRY_READY_SHORT"
+            res["message"] = "Price retesting support after breakout."
+        else:
+            res["signal"] = "BREAKOUT_SHORT"
+            res["message"] = "Breakdown below support. Wait pullback to enter."
+        res["entry"] = round(entry, 2)
+        res["sl"] = round(entry + sl_points, 2)
+        res["tp1"] = round(entry - tp1_points, 2)
+        res["tp2"] = round(entry - tp2_points, 2)
+        return res
+
+    res["message"] = "WAIT — รอราคาเบรกกรอบบน/ล่าง (ภายใน 2–3 ชม. ที่ TF ต่ำ)."
+    return res
+
+
+# =========================
+# Core Logic (แบบใหม่ /breakout)
+# =========================
+def analyze_breakout(symbol: str, tf_high: str, tf_low: str) -> Dict[str, Any]:
+    """
+    Logic ใหม่ตามที่คุยกัน:
+      - ใช้ tf_high (H1/H4) หา 'กรอบ' จาก high/low ของแท่งปิดล่าสุด
+      - จับตา tf_low (M5/M15) แล้วให้สัญญาณเมื่อเบรกกรอบ + เงื่อนไขรีเทสต์
+      - ให้ entry หลัก = เส้นกรอบ, entry_50 = จุดย้อนกลับ 50% ของแท่งเบรก
+      - SL/TP ใช้ 250/500/1000 จุด
+    """
+    ref = previous_closed(fetch_series(symbol, tf_high, 50))
     upper = ref.high
     lower = ref.low
 
-    # --- ดึง TF ต่ำ 2–3 แท่งล่าสุด ---
-    lo_bars = fetch_series(symbol, low_tf, 30)
-    if len(lo_bars) < 2:
+    bars = fetch_series(symbol, tf_low, 30)
+    if len(bars) < 2:
         return {"status": "ERROR", "message": "Not enough low timeframe data."}
-    last = lo_bars[0]
-    prev = lo_bars[1]
+    last, prev = bars[0], bars[1]
 
-    # เบรกโดย close cross
-    up_break = crossed_above(prev.close, last.close, upper)
-    dn_break = crossed_below(prev.close, last.close, lower)
+    sl_points, tp1_points, tp2_points = 250.0, 500.0, 1000.0
 
-    # ค่าคงที่ RR (จุด)
-    sl_points = 250.0
-    tp1_points = 500.0
-    tp2_points = 1000.0
-
-    # โครงผลลัพธ์ (สั้นกระชับตามที่ขอ) + เก็บ overlay last/prev ไว้ใช้ภายหลังได้
-    result: Dict[str, Any] = {
+    res: Dict[str, Any] = {
         "status": "OK",
         "symbol": symbol,
-        "tf_high": high_tf,
-        "tf_low": low_tf,
+        "tf_high": tf_high,
+        "tf_low": tf_low,
         "box": {
             "upper": round(upper, 2),
             "lower": round(lower, 2),
-            "ref_bar": {
-                "dt":   ref.dt,
-                "open": round(ref.open,  2),
-                "high": round(ref.high,  2),
-                "low":  round(ref.low,   2),
-                "close":round(ref.close, 2),
-            },
+            "ref_bar": ref.model_dump(),
         },
-        "overlay": {  # ให้ UI เดิมยังดูแท่งล่าสุดได้
-            "last": {
-                "dt": last.dt, "open": round(last.open,2),
-                "high": round(last.high,2), "low": round(last.low,2),
-                "close": round(last.close,2),
-            },
-            "prev": {
-                "dt": prev.dt, "open": round(prev.open,2),
-                "high": round(prev.high,2), "low": round(prev.low,2),
-                "close": round(prev.close,2),
-            },
+        "overlay": {
+            "last": last.model_dump(),
+            "prev": prev.model_dump(),
         },
         "signal": None,
         "entry": None,
@@ -217,54 +266,50 @@ def analyze_signal(symbol: str, low_tf: str) -> Dict[str, Any]:
         "message": "",
     }
 
-    # ---------- Breakout LONG ----------
-    if up_break:
+    up = crossed_above(prev.close, last.close, upper)
+    dn = crossed_below(prev.close, last.close, lower)
+
+    if up:
         body = abs(last.close - prev.close)
-        entry_level = upper
+        entry = upper
         tol = max(100.0, 0.5 * body)
-
-        if near(last.close, entry_level, tol):
-            result["signal"]  = "ENTRY_READY_LONG"
-            result["message"] = f"Retest near {high_tf} resistance — ready to enter long."
+        res["entry"] = round(entry, 2)
+        res["entry_50"] = round(entry - 0.5 * body, 2)
+        res["sl"] = round(entry - sl_points, 2)
+        res["tp1"] = round(entry + tp1_points, 2)
+        res["tp2"] = round(entry + tp2_points, 2)
+        if near(last.close, entry, tol):
+            res["signal"] = "ENTRY_READY_LONG"
+            res["message"] = "Retest กลับเหนือกรอบบนหลังเบรก"
         else:
-            result["signal"]  = "BREAKOUT_LONG"
-            result["message"] = f"Breakout above {high_tf} resistance — wait pullback to enter."
+            res["signal"] = "BREAKOUT_LONG"
+            res["message"] = "เบรกกรอบบน รอรีเทสแล้วค่อยเข้า"
+        return res
 
-        result["entry"]    = round(entry_level, 2)
-        result["entry_50"] = round(entry_level + 0.5 * (last.close - entry_level), 2)
-        result["sl"]       = round(entry_level - sl_points, 2)
-        result["tp1"]      = round(entry_level + tp1_points, 2)
-        result["tp2"]      = round(entry_level + tp2_points, 2)
-        return result
-
-    # ---------- Breakout SHORT ----------
-    if dn_break:
+    if dn:
         body = abs(last.close - prev.close)
-        entry_level = lower
+        entry = lower
         tol = max(100.0, 0.5 * body)
-
-        if near(last.close, entry_level, tol):
-            result["signal"]  = "ENTRY_READY_SHORT"
-            result["message"] = f"Retest near {high_tf} support — ready to enter short."
+        res["entry"] = round(entry, 2)
+        res["entry_50"] = round(entry + 0.5 * body, 2)
+        res["sl"] = round(entry + sl_points, 2)
+        res["tp1"] = round(entry - tp1_points, 2)
+        res["tp2"] = round(entry - tp2_points, 2)
+        if near(last.close, entry, tol):
+            res["signal"] = "ENTRY_READY_SHORT"
+            res["message"] = "Retest กลับใต้กรอบล่างหลังเบรก"
         else:
-            result["signal"]  = "BREAKOUT_SHORT"
-            result["message"] = f"Breakdown below {high_tf} support — wait pullback to enter."
+            res["signal"] = "BREAKOUT_SHORT"
+            res["message"] = "เบรกกรอบล่าง รอรีเทสแล้วค่อยเข้า"
+        return res
 
-        result["entry"]    = round(entry_level, 2)
-        result["entry_50"] = round(entry_level + 0.5 * (last.close - entry_level), 2)
-        result["sl"]       = round(entry_level + sl_points, 2)
-        result["tp1"]      = round(entry_level - tp1_points, 2)
-        result["tp2"]      = round(entry_level - tp2_points, 2)
-        return result
-
-    # ---------- ยังไม่เบรก ----------
-    result["message"] = f"WAIT — รอราคาเบรกกรอบ {high_tf} บน/ล่าง (ที่ TF {low_tf})."
-    return result
+    res["message"] = "WAIT — รอราคาเบรกกรอบบน/ล่าง (ที่ TF ต่ำ)."
+    return res
 
 
-# ========================
+# =========================
 # Routes
-# ========================
+# =========================
 @app.get("/")
 def root():
     return {"app": "xau-scanner", "version": APP_VERSION, "ok": True}
@@ -272,13 +317,40 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "ts": datetime.utcnow().isoformat() + "Z"}
+    return {"ok": True}
 
 
-@app.post("/signal")
-def signal(req: SignalRequest):
+# ✅ เอนด์พอยน์ต์ใหม่ (ใช้ tf_high + tf_low)
+@app.post("/breakout")
+def breakout(req: BreakoutRequest):
     try:
-        return analyze_signal(req.symbol, req.tf)
+        return analyze_breakout(req.symbol, req.tf_high, req.tf_low)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ✅ ทำ /signal ให้รองรับทั้งรูปแบบเก่า/ใหม่ (backward compatible)
+@app.post("/signal")
+def signal_compat(payload: Dict[str, Any]):
+    """
+    รองรับ:
+      {symbol, tf}                 -> วิเคราะห์แบบเดิม
+      {symbol, tf_high, tf_low}    -> วิเคราะห์แบบ breakout ใหม่
+    """
+    try:
+        if "tf" in payload:
+            req = SignalRequest(**payload)
+            return analyze_signal(req.symbol, req.tf)
+        elif "tf_high" in payload and "tf_low" in payload:
+            req = BreakoutRequest(**payload)
+            return analyze_breakout(req.symbol, req.tf_high, req.tf_low)
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail="Require either (symbol, tf) or (symbol, tf_high, tf_low).",
+            )
     except HTTPException:
         raise
     except Exception as e:
