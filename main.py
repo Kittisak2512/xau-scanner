@@ -1,256 +1,180 @@
-import os
-from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
-from datetime import datetime, timezone
-import requests
-
-APP_VERSION = "2025-09-12.1"
-
-# --------------------
-# Config / ENV
-# --------------------
-TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
-ALLOWED = os.getenv("ALLOWED_ORIGINS", "*").strip()
-ALLOW_ORIGINS = ["*"] if (ALLOWED == "*" or ALLOWED == "") else [o.strip() for o in ALLOWED.split(",") if o.strip()]
-
-# --------------------
-# App
-# --------------------
-app = FastAPI(title="xau-scanner")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --------------------
-# Models
-# --------------------
-ALLOWED_TFS = {"M5": "5min", "M15": "15min", "M30": "30min", "H1": "1h", "H4": "4h", "D1": "1day"}
-
-class StructureRequest(BaseModel):
-    symbol: str = Field(..., examples=["XAU/USD", "XAUUSD"])
-    tfs: List[str] = Field(..., examples=[["M5","M15","M30","H1","H4","D1"]])
-
-    @field_validator("tfs")
-    @classmethod
-    def validate_tfs(cls, v: List[str]) -> List[str]:
-        cleaned = []
-        for tf in v:
-            t = tf.upper()
-            if t not in ALLOWED_TFS:
-                raise ValueError(f"Unsupported TF: {tf}")
-            if t not in cleaned:
-                cleaned.append(t)
-        if not cleaned:
-            raise ValueError("tfs must not be empty")
-        return cleaned
-
-
-# --------------------
-# Helpers
-# --------------------
-def norm_symbol(sym: str) -> str:
-    s = sym.replace(" ", "")
-    if s.upper() == "XAUUSD":
-        return "XAU/USD"
-    return sym
-
-def td_fetch_series(symbol: str, tf: str, size: int = 300) -> List[Dict[str, Any]]:
-    if not TWELVEDATA_API_KEY:
-        raise HTTPException(500, detail="Missing TWELVEDATA_API_KEY")
-
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol,
-        "interval": ALLOWED_TFS[tf],  # map to twelvedata interval
-        "outputsize": size,
-        "order": "desc",
-        "timezone": "UTC",
-        "apikey": TWELVEDATA_API_KEY,
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ForexPro — Structure Scanner</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0b0f14;
+      --card: #111827;
+      --muted: #3a3b46;
+      --text: #e5e5e5;
+      --accent: #22c55e;
+      --danger: #ef4444;
+      --btn: #1f2937;
+      --btn-bd: #334155;
     }
-    try:
-        r = requests.get(url, params=params, timeout=25)
-        data = r.json()
-    except Exception:
-        raise HTTPException(502, detail="Upstream not JSON")
-
-    if isinstance(data, dict) and data.get("status") == "error":
-        raise HTTPException(502, detail=f"TwelveData: {data.get('message','error')}")
-
-    values = data.get("values")
-    if not values:
-        raise HTTPException(502, detail="No bars from TwelveData")
-
-    # values is latest-first. Normalize numeric types.
-    bars: List[Dict[str, Any]] = []
-    for v in values:
-        try:
-            bars.append({
-                "dt": v["datetime"],
-                "open": float(v["open"]),
-                "high": float(v["high"]),
-                "low": float(v["low"]),
-                "close": float(v["close"]),
-            })
-        except Exception:
-            continue
-
-    if not bars:
-        raise HTTPException(502, detail="Cannot parse bars")
-    return bars  # latest-first
-
-
-def last_closed(bars: List[Dict[str, Any]]) -> Dict[str, Any]:
-    # TwelveData returns closed bars latest-first; use index 0.
-    return bars[0]
-
-
-# --- Simple SR detection (swing based clustering) ---
-def detect_support_resistance(
-    bars: List[Dict[str, Any]],
-    swing_lookback: int = 5,
-    cluster_tol: float = 0.25,
-    top_n: int = 2
-) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Find swing highs/lows and then cluster them to produce compact S/R levels.
-    - swing_lookback: number of bars to check around pivot (2 on each side by default if 5)
-    - cluster_tol: points tolerance to merge nearby levels
-    - top_n: limit number of S and R levels
-    """
-    if len(bars) < max(20, swing_lookback + 3):
-        return {"resistance": [], "support": []}
-
-    # work with oldest-first for pivot check
-    seq = list(reversed(bars))  # oldest -> newest
-
-    piv_highs: List[float] = []
-    piv_lows: List[float] = []
-
-    k = swing_lookback // 2
-    for i in range(k, len(seq) - k):
-        window = seq[i - k: i + k + 1]
-        high_vals = [b["high"] for b in window]
-        low_vals = [b["low"] for b in window]
-        c = seq[i]
-        if c["high"] == max(high_vals):
-            piv_highs.append(c["high"])
-        if c["low"] == min(low_vals):
-            piv_lows.append(c["low"])
-
-    def cluster(levels: List[float], tol: float, reverse: bool) -> List[Dict[str, Any]]:
-        # merge nearby levels; touches = count inside cluster
-        levels = sorted(levels, reverse=reverse)
-        clusters: List[Dict[str, Any]] = []
-        for lv in levels:
-            placed = False
-            for c in clusters:
-                if abs(c["price"] - lv) <= tol:
-                    # running average for center
-                    c["price"] = (c["price"] * c["touches"] + lv) / (c["touches"] + 1)
-                    c["touches"] += 1
-                    placed = True
-                    break
-            if not placed:
-                clusters.append({"price": lv, "touches": 1})
-        # resort by importance (touches) then by price desc for R / asc for S
-        clusters.sort(key=lambda x: (-x["touches"], -x["price"] if reverse else x["price"]))
-        return clusters[:top_n]
-
-    rs = cluster(piv_highs, cluster_tol, reverse=True)
-    ss = cluster(piv_lows, cluster_tol, reverse=False)
-
-    # round to 2 decimals for XAU ticks-like presentation
-    for c in rs + ss:
-        c["price"] = round(c["price"], 2)
-    return {"resistance": rs, "support": ss}
-
-
-# --- Very light Order Block detection ---
-def detect_order_blocks(bars: List[Dict[str, Any]], min_impulse_points: float = 6.0) -> List[Dict[str, Any]]:
-    """
-    Simple OB finder:
-      - Bullish OB: bearish base candle followed by a strong bullish impulse (close - open >= min_impulse_points).
-      - Bearish OB: bullish base candle followed by a strong bearish impulse (open - close >= min_impulse_points).
-    Returns the most recent OB (bullish/ bearish) with its price range.
-    """
-    if len(bars) < 5:
-        return []
-
-    # latest-first; check from newest -> older
-    for i in range(1, min(60, len(bars) - 1)):
-        base = bars[i]     # prior bar
-        imp = bars[i - 1]  # impulse bar (newer)
-
-        bull_imp = (imp["close"] - imp["open"]) >= min_impulse_points
-        bear_imp = (imp["open"] - imp["close"]) >= min_impulse_points
-
-        if base["close"] < base["open"] and bull_imp:
-            # Bullish OB zone: base low .. base open (conservative)
-            low = min(base["low"], base["open"])
-            high = max(base["low"], base["open"])
-            return [{"side": "Bullish", "range": [round(low, 2), round(high, 2)]}]
-
-        if base["close"] > base["open"] and bear_imp:
-            # Bearish OB zone: base open .. base high
-            low = min(base["open"], base["high"])
-            high = max(base["open"], base["high"])
-            return [{"side": "Bearish", "range": [round(low, 2), round(high, 2)]}]
-
-    return []
-
-
-def build_tf_snapshot(bars: List[Dict[str, Any]]) -> Dict[str, Any]:
-    sr = detect_support_resistance(bars, swing_lookback=5, cluster_tol=0.25, top_n=2)
-    obs = detect_order_blocks(bars, min_impulse_points=6.0)
-    last = last_closed(bars)
-    out = {
-        "last_bar": {
-            "dt": last["dt"],
-            "open": last["open"],
-            "high": last["high"],
-            "low": last["low"],
-            "close": last["close"],
-        },
-        "resistance": sr["resistance"],
-        "support": sr["support"],
-        "order_blocks": obs,
+    body {
+      margin: 0;
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
     }
-    return out
-
-
-# --------------------
-# Routes
-# --------------------
-@app.get("/")
-def root():
-    return {"app": "xau-scanner", "version": APP_VERSION, "ok": True}
-
-@app.get("/health")
-def health():
-    return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
-
-@app.post("/structure")
-def structure(req: StructureRequest):
-    symbol = norm_symbol(req.symbol)
-    results: Dict[str, Any] = {}
-    try:
-        for tf in req.tfs:
-            bars = td_fetch_series(symbol, tf, size=300)
-            results[tf] = build_tf_snapshot(bars)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, detail=f"structure error: {e}")
-
-    return {
-        "status": "OK",
-        "symbol": symbol,
-        "results": results,
+    header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 15px;
+      border-bottom: 1px solid var(--muted);
     }
+    header img {
+      height: 40px;
+    }
+    header h1 {
+      font-size: 1.2rem;
+      font-weight: 700;
+      margin: 0;
+    }
+    main {
+      padding: 20px;
+      max-width: 900px;
+      margin: 0 auto;
+    }
+    .form-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    input[type=text] {
+      background: var(--card);
+      border: 1px solid var(--btn-bd);
+      color: var(--text);
+      padding: 8px 10px;
+      border-radius: 6px;
+      flex: 1;
+      min-width: 200px;
+    }
+    button {
+      background: var(--btn);
+      border: 1px solid var(--btn-bd);
+      border-radius: 6px;
+      padding: 8px 12px;
+      color: var(--text);
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    .check-group {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+    label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    #results {
+      margin-top: 20px;
+    }
+    .card {
+      background: var(--card);
+      border-radius: 8px;
+      padding: 15px;
+      margin-bottom: 20px;
+    }
+    h3 {
+      margin: 0 0 5px 0;
+      font-size: 1.1rem;
+    }
+    h4 {
+      margin: 10px 0 4px;
+      font-size: 0.9rem;
+      font-weight: 600;
+    }
+    .line-items {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .pill {
+      background: var(--muted);
+      padding: 4px 8px;
+      border-radius: 6px;
+      font-size: 0.8rem;
+    }
+    .pill.bull {
+      background: #14532d;
+      color: #bbf7d0;
+    }
+    .pill.bear {
+      background: #7f1d1d;
+      color: #fecaca;
+    }
+    .badge {
+      background: #334155;
+      border-radius: 4px;
+      padding: 2px 4px;
+      margin-right: 4px;
+      font-size: 0.7rem;
+    }
+    .empty {
+      color: #666;
+      font-size: 0.8rem;
+    }
+    .summary {
+      margin-bottom: 15px;
+      font-weight: 600;
+    }
+    .info {
+      padding: 8px;
+      background: #1e293b;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      margin-bottom: 8px;
+    }
+    .error {
+      padding: 8px;
+      background: #450a0a;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      white-space: pre-wrap;
+      color: #fecaca;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <img src="logo.png" alt="ForexPro Logo" />
+    <h1>ForexPro — Structure Scanner</h1>
+  </header>
+  <main>
+    <div class="form-row">
+      <input type="text" id="backendUrl" placeholder="Backend URL เช่น https://xau-scanner.onrender.com" />
+      <input type="text" id="symbolInput" placeholder="Symbol เช่น XAUUSD" />
+    </div>
+    <div class="check-group">
+      <label><input type="checkbox" id="tfM5" checked /> M5</label>
+      <label><input type="checkbox" id="tfM15" checked /> M15</label>
+      <label><input type="checkbox" id="tfM30" checked /> M30</label>
+      <label><input type="checkbox" id="tfH1" checked /> H1</label>
+      <label><input type="checkbox" id="tfH4" checked /> H4</label>
+      <label><input type="checkbox" id="tfD1" checked /> D1</label>
+    </div>
+    <div class="form-row">
+      <button id="btnSaveUrl">💾 บันทึก URL</button>
+      <button id="btnScan">🔎 สแกนโครงสร้าง</button>
+    </div>
+    <div id="results"></div>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
