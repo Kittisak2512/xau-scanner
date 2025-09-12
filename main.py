@@ -1,18 +1,19 @@
+# main.py
 import os
 from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone
+
+import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
-import requests
-from datetime import datetime, timezone
 
 APP_VERSION = "2025-09-12.2"
 
-# ========= Config =========
+# =========================
+# Config / Environment
+# =========================
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
-if not TWELVEDATA_API_KEY:
-    # อนุญาตให้แอพสตาร์ท แต่จะ error ตอนเรียก /structure ถ้าไม่ได้ตั้งค่า key
-    pass
 
 _ALLOWED = os.getenv("ALLOWED_ORIGINS", "*").strip()
 if _ALLOWED in ("", "*"):
@@ -20,7 +21,9 @@ if _ALLOWED in ("", "*"):
 else:
     ALLOW_ORIGINS = [o.strip() for o in _ALLOWED.split(",") if o.strip()]
 
-# ========= App =========
+# =========================
+# App
+# =========================
 app = FastAPI(title="xau-scanner")
 
 app.add_middleware(
@@ -31,24 +34,64 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ========= Models =========
-ALL_TFS = ["M5", "M15", "M30", "H1", "H4", "D1"]
-
+# =========================
+# Models
+# =========================
 class StructureRequest(BaseModel):
     symbol: str = Field(..., examples=["XAU/USD", "XAUUSD"])
-    timeframes: List[str] = Field(..., examples=[["M5", "M15", "M30", "H1", "H4", "D1"]])
+    tfs: Optional[List[str]] = Field(
+        None,
+        description="Timeframes in {M5,M15,M30,H1,H4,D1}. If omitted -> all.",
+        examples=[["M5", "M15", "M30", "H1", "H4", "D1"]],
+    )
 
-    @field_validator("timeframes")
+    @field_validator("tfs")
     @classmethod
-    def validate_tfs(cls, tfs: List[str]) -> List[str]:
-        up = [t.upper() for t in tfs]
-        for t in up:
-            if t not in ALL_TFS:
-                raise ValueError(f"Unsupported TF: {t}")
-        return up
+    def check_tfs(cls, v):
+        if v is None:
+            return None
+        allowed = {"M5", "M15", "M30", "H1", "H4", "D1"}
+        vv = [s.upper() for s in v]
+        for s in vv:
+            if s not in allowed:
+                raise ValueError(f"Unsupported tf: {s}")
+        return vv
 
 
-# ========= Utilities =========
+# =========================
+# Utilities
+# =========================
+
+def normalize_symbol(raw: str) -> str:
+    """
+    Auto-convert user input symbols to TwelveData format.
+    - 'XAUUSD'  -> 'XAU/USD'
+    - 'eurusd'  -> 'EUR/USD'
+    - 'XAU/USD' stays the same
+    If has suffix like ':CUR' or ':FOREX', keep it.
+    """
+    s = (raw or "").strip().upper().replace(" ", "")
+    if not s:
+        return s
+
+    # If already has '/', just return
+    if "/" in s:
+        return s
+
+    # If contains suffix like ':CUR', ':FOREX', split first
+    suffix = ""
+    if ":" in s:
+        base, suf = s.split(":", 1)
+        s = base
+        suffix = ":" + suf
+
+    # If exactly 6 alphabetic chars -> insert slash 3/3
+    if len(s) == 6 and s.isalpha():
+        s = f"{s[:3]}/{s[3:]}"
+
+    return s + suffix
+
+
 def td_interval(tf: str) -> str:
     m = tf.upper()
     mapping = {
@@ -64,10 +107,13 @@ def td_interval(tf: str) -> str:
     return mapping[m]
 
 
-def fetch_series(symbol: str, tf: str, size: int = 500) -> List[Dict[str, Any]]:
-    """ดึงแท่งเทียนจาก TwelveData (เรียงจากใหม่ไปเก่า)"""
+def fetch_series(symbol: str, tf: str, size: int = 200) -> List[Dict[str, Any]]:
+    """
+    Fetch candles (latest first) from TwelveData.
+    """
     if not TWELVEDATA_API_KEY:
         raise HTTPException(status_code=500, detail="Missing TWELVEDATA_API_KEY")
+
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol,
@@ -77,191 +123,109 @@ def fetch_series(symbol: str, tf: str, size: int = 500) -> List[Dict[str, Any]]:
         "timezone": "UTC",
         "apikey": TWELVEDATA_API_KEY,
     }
-    r = requests.get(url, params=params, timeout=25)
+    r = requests.get(url, params=params, timeout=20)
     try:
         data = r.json()
     except Exception:
         raise HTTPException(status_code=502, detail="Upstream returned non-JSON")
 
-    if data.get("status") == "error":
+    if isinstance(data, dict) and data.get("status") == "error":
+        # bubble upstream error message to frontend
         raise HTTPException(status_code=502, detail=str(data.get("message", "API error")))
     values = data.get("values")
     if not values:
         raise HTTPException(status_code=502, detail="No data from TwelveData")
+
+    # parse to floats and keep only necessary fields
     out = []
     for v in values:
         try:
-            out.append({
-                "dt": v["datetime"],
-                "open": float(v["open"]),
-                "high": float(v["high"]),
-                "low": float(v["low"]),
-                "close": float(v["close"]),
-            })
+            out.append(
+                {
+                    "dt": v["datetime"],
+                    "open": float(v["open"]),
+                    "high": float(v["high"]),
+                    "low": float(v["low"]),
+                    "close": float(v["close"]),
+                }
+            )
         except Exception:
-            # ข้ามแท่งที่พาร์สไม่ได้
             continue
     if not out:
         raise HTTPException(status_code=502, detail="Cannot parse bars")
     return out  # latest first
 
 
-def local_swings(bars: List[Dict[str, Any]], k: int = 3, want: str = "high", max_points: int = 3) -> List[Dict[str, Any]]:
+def compute_support_resistance(bars: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    หา swing highs/lows แบบง่าย:
-    - want == "high": bar[i].high เป็นสูงสุดเมื่อเทียบกับ i-k..i+k
-    - want == "low" : bar[i].low  เป็นต่ำสุดเมื่อเทียบกับ i-k..i+k
-    คืนค่าเป็นรายการระดับ + แต้มสัมผัส (touches) โดยรวม nearby levels เข้าด้วยกัน
+    Lightweight support/resistance:
+    - resistance: max of last N highs
+    - support: min of last N lows
+    N uses all bars fetched (already small ~200, latest first).
     """
-    n = len(bars)
-    if n < 2*k + 1:
-        return []
-
-    # ใช้ชุดเรียงจากเก่าไปใหม่เพื่อสแกนได้ลื่น
-    fwd = list(reversed(bars))  # เก่าสุด -> ใหม่สุด
-    idx_levels: List[float] = []
-
-    for i in range(k, len(fwd)-k):
-        win = fwd[i-k:i+k+1]
-        if want == "high":
-            peak = max(b["high"] for b in win)
-            if abs(fwd[i]["high"] - peak) < 1e-9:
-                idx_levels.append(fwd[i]["high"])
-        else:
-            trough = min(b["low"] for b in win)
-            if abs(fwd[i]["low"] - trough) < 1e-9:
-                idx_levels.append(fwd[i]["low"])
-
-    # รวมระดับที่อยู่ใกล้กัน (cluster)
-    idx_levels.sort()
-    clusters: List[List[float]] = []
-    gap = max(0.2, (sum(b["high"]-b["low"] for b in fwd[-50:]) / max(1, min(50, len(fwd)))) * 0.15)  # ~15% ของ avg range ล่าสุด
-    for lv in idx_levels:
-        if not clusters or abs(lv - clusters[-1][-1]) > gap:
-            clusters.append([lv])
-        else:
-            clusters[-1].append(lv)
-
-    levels: List[float] = [round(sum(c)/len(c), 2) for c in clusters]
-    # นับ touches บริเวณระดับนั้น ๆ
-    res = []
-    tol = gap
-    for lv in levels:
-        touches = 0
-        for b in fwd:
-            if want == "high":
-                # โดนใกล้ ๆ high
-                if abs(b["high"] - lv) <= tol:
-                    touches += 1
-            else:
-                if abs(b["low"] - lv) <= tol:
-                    touches += 1
-        res.append({"level": round(lv, 2), "touches": touches})
-
-    # เรียงจากใกล้ราคาปัจจุบัน (ล่าสุด) และตัดแค่ max_points จุด
-    last_close = bars[0]["close"]
-    res.sort(key=lambda x: abs(x["level"] - last_close))
-    return res[:max_points]
+    highs = [b["high"] for b in bars]
+    lows = [b["low"] for b in bars]
+    resistance = round(max(highs), 2)
+    support = round(min(lows), 2)
+    return {"resistance": resistance, "support": support}
 
 
-def detect_order_blocks(bars: List[Dict[str, Any]], lookback: int = 120, min_move: float = 2.0) -> List[Dict[str, Any]]:
-    """
-    ตรวจ OB แบบง่าย:
-    - หาแท่ง impulsive move: |close-open| > min_move และเป็นแท่งที่มี body ใหญ่กว่าเพื่อนใกล้ ๆ
-    - โซน OB = ช่วง [min(open, close), max(open, close)] ของแท่งก่อนหน้า (base candle) 1 แท่ง
-    จงใจทำแบบ conservative และคืนไม่กี่โซน
-    """
-    res = []
-    arr = bars[:lookback]  # ล่าสุด -> ย้อนหลัง
-    if len(arr) < 5:
-        return res
-    # ใช้ค่า min_move เป็นสัดส่วนจาก true-range เฉลี่ยช่วงสั้น หาก min_move < 1 แปลว่าเป็น factor
-    if min_move < 1.0:
-        recent = arr[:30]
-        avg_tr = sum((b["high"] - b["low"]) for b in recent) / max(1, len(recent))
-        threshold = avg_tr * (1.8)  # 1.8x ของ TR เฉลี่ย
-    else:
-        threshold = min_move
+# =========================
+# Core
+# =========================
+ALL_TFS = ["M5", "M15", "M30", "H1", "H4", "D1"]
 
-    # ไล่จากเก่าสุด -> ใหม่สุด เพื่อได้โซนลำดับล่าสุดท้ายรายการ
-    fwd = list(reversed(arr))
-    for i in range(2, len(fwd)):
-        c = fwd[i]
-        body = abs(c["close"] - c["open"])
-        if body < threshold:
-            continue
-        base = fwd[i-1]
-        zone_low = min(base["open"], base["close"])
-        zone_high = max(base["open"], base["close"])
-        ob_type = "Bullish" if c["close"] > c["open"] else "Bearish"
-        # รวมโซนที่ซ้ำซ้อน
-        merged = False
-        for z in res:
-            if (abs(z["low"] - zone_low) < 0.2) and (abs(z["high"] - zone_high) < 0.2) and z["type"] == ob_type:
-                merged = True
-                break
-        if not merged:
-            res.append({
-                "type": ob_type,
-                "low": round(zone_low, 2),
-                "high": round(zone_high, 2),
-            })
-        if len(res) >= 4:
-            break
+def build_tf_payload(norm_symbol: str, tf: str) -> Dict[str, Any]:
+    bars = fetch_series(norm_symbol, tf, size=200)  # latest first
+    sr = compute_support_resistance(bars)
 
-    # โชว์โซนที่อยู่ใกล้ราคาล่าสุดก่อน
-    last_close = bars[0]["close"]
-    res.sort(key=lambda z: abs((z["low"]+z["high"])/2 - last_close))
-    return res[:3]
-
-
-def compute_structure_for_tf(symbol: str, tf: str) -> Dict[str, Any]:
-    bars = fetch_series(symbol, tf, size=500)  # ล่าสุด -> ย้อนหลัง
-    # ค่าเวลาล่าสุด
-    last_dt = bars[0]["dt"]
     last = bars[0]
-
-    # สร้างแนวต้าน/แนวรับจาก swing
-    resistances = local_swings(bars, k=3, want="high", max_points=3)
-    supports    = local_swings(bars, k=3, want="low",  max_points=3)
-
-    # หา OB แบบง่าย
-    order_blocks = detect_order_blocks(bars, lookback=180, min_move=0.0)  # ให้คำนวณจาก TR เฉลี่ย
-
-    return {
+    payload = {
         "tf": tf,
         "last_bar": {
-            "dt": last_dt,
-            "open": round(last["open"], 2),
-            "high": round(last["high"], 2),
-            "low": round(last["low"], 2),
-            "close": round(last["close"], 2),
+            "dt": last["dt"],
+            "open": last["open"],
+            "high": last["high"],
+            "low": last["low"],
+            "close": last["close"],
         },
-        "resistance": [{"level": r["level"], "touches": r["touches"]} for r in resistances],
-        "support": [{"level": s["level"], "touches": s["touches"]} for s in supports],
-        "order_blocks": order_blocks,
+        "resistance": sr["resistance"],
+        "support": sr["support"],
+        "order_blocks": [],  # kept for compatibility; you can fill later if needed
     }
+    return payload
 
 
-# ========= Routes =========
+# =========================
+# Routes
+# =========================
 @app.get("/")
 def root():
     return {"app": "xau-scanner", "version": APP_VERSION, "ok": True}
+
 
 @app.get("/health")
 def health():
     return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
 
+
 @app.post("/structure")
 def structure(req: StructureRequest):
     try:
-        results = []
-        for tf in req.timeframes:
-            results.append(compute_structure_for_tf(req.symbol, tf))
+        # normalize symbol for TwelveData
+        norm_symbol = normalize_symbol(req.symbol)
+
+        tfs = req.tfs or ALL_TFS
+        results: List[Dict[str, Any]] = []
+        for tf in tfs:
+            results.append(build_tf_payload(norm_symbol, tf))
+
         return {
             "status": "OK",
-            "symbol": req.symbol,
-            "results": results
+            "symbol_input": req.symbol,
+            "symbol": norm_symbol,
+            "tfs": tfs,
+            "results": results,
         }
     except HTTPException:
         raise
