@@ -1,28 +1,26 @@
-# main.py
 import os
-import re
-from typing import List, Dict, Any
-from datetime import datetime, timezone
-
-import requests
+import math
+from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
+import requests
+from datetime import datetime
 
-APP_VERSION = "2025-09-12.3"
+APP_VERSION = "2025-09-12.2"
 
-# =========================
-# Config & CORS
-# =========================
-TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
+TD_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
+if not TD_KEY:
+    # ให้รันขึ้น แต่หากเรียก /structure จะ error ชัดเจน
+    pass
+
 _ALLOWED = os.getenv("ALLOWED_ORIGINS", "*").strip()
-
 if _ALLOWED in ("", "*"):
     ALLOW_ORIGINS = ["*"]
 else:
     ALLOW_ORIGINS = [o.strip() for o in _ALLOWED.split(",") if o.strip()]
 
-app = FastAPI(title="xau-scanner", version=APP_VERSION)
+app = FastAPI(title="xau-scanner")
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,272 +30,193 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================
-# Models
-# =========================
+# ---------- Models ----------
 class StructureRequest(BaseModel):
-    symbol: str = Field(..., description="เช่น XAUUSD หรือ XAU/USD")
-    tfs: List[str] = Field(..., description="['M5','M15','M30','H1','H4','D1']")
+    symbol: str = Field(..., examples=["XAUUSD", "XAU/USD"])
+    tfs: List[str] = Field(..., examples=[["M5", "M15", "M30", "H1", "H4", "D1"]])
 
     @field_validator("tfs")
     @classmethod
     def check_tfs(cls, v: List[str]) -> List[str]:
         allowed = {"M5", "M15", "M30", "H1", "H4", "D1"}
         vv = [x.upper() for x in v]
-        bad = [x for x in vv if x not in allowed]
-        if bad:
-            raise ValueError(f"Unsupported TF: {bad}. Allowed: {sorted(list(allowed))}")
+        for x in vv:
+            if x not in allowed:
+                raise ValueError(f"Unsupported TF: {x}")
         return vv
 
-# =========================
-# Utilities
-# =========================
-def normalize_symbol(sym: str) -> str:
-    s = sym.strip().upper()
-    if "/" in s:
-        return s
-    letters = re.sub(r"[^A-Z]", "", s)
-    if len(letters) == 6:
-        return f"{letters[:3]}/{letters[3:]}"
+
+# ---------- Helpers ----------
+def normalize_symbol(s: str) -> str:
+    s = s.strip().upper().replace(" ", "")
+    # ตัวอย่าง: XAUUSD -> XAU/USD
+    if "/" not in s and len(s) >= 6:
+        base = s[:3]
+        quote = s[3:]
+        s = f"{base}/{quote}"
     return s
 
 def td_interval(tf: str) -> str:
-    mapping = {
-        "M5": "5min",
-        "M15": "15min",
-        "M30": "30min",
-        "H1": "1h",
-        "H4": "4h",
-        "D1": "1day",
-    }
-    if tf not in mapping:
-        raise ValueError(f"Unsupported TF: {tf}")
-    return mapping[tf]
+    m = tf.upper()
+    if m == "M5": return "5min"
+    if m == "M15": return "15min"
+    if m == "M30": return "30min"
+    if m == "H1": return "1h"
+    if m == "H4": return "4h"
+    if m == "D1": return "1day"
+    raise ValueError(f"Unsupported TF {tf}")
 
 def fetch_series(symbol: str, tf: str, size: int = 250) -> List[Dict[str, Any]]:
-    if not TWELVEDATA_API_KEY:
+    if not TD_KEY:
         raise HTTPException(status_code=500, detail="Missing TWELVEDATA_API_KEY")
-
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol,
         "interval": td_interval(tf),
         "outputsize": size,
-        "order": "desc",   # ล่าสุดมาก่อน
+        "order": "desc",
         "timezone": "UTC",
-        "apikey": TWELVEDATA_API_KEY,
+        "apikey": TD_KEY,
     }
+    r = requests.get(url, params=params, timeout=25)
     try:
-        r = requests.get(url, params=params, timeout=25)
         data = r.json()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"TwelveData error: {e}")
+    except Exception:
+        raise HTTPException(status_code=502, detail="Upstream returned non-JSON")
 
     if isinstance(data, dict) and data.get("status") == "error":
-        raise HTTPException(status_code=502, detail=str(data.get("message", "API error")))
+        # ส่งผ่าน error ของ TwelveData กลับไปให้เห็นชัด
+        raise HTTPException(status_code=502, detail=data.get("message", "API error"))
 
-    values = (data or {}).get("values")
+    values = data.get("values")
     if not values:
         raise HTTPException(status_code=502, detail="No data from TwelveData")
 
-    rows: List[Dict[str, Any]] = []
+    bars: List[Dict[str, Any]] = []
     for v in values:
         try:
-            rows.append(
-                {
-                    "dt": v["datetime"],
-                    "open": float(v["open"]),
-                    "high": float(v["high"]),
-                    "low": float(v["low"]),
-                    "close": float(v["close"]),
-                }
-            )
+            bars.append({
+                "dt": v["datetime"],
+                "open": float(v["open"]),
+                "high": float(v["high"]),
+                "low": float(v["low"]),
+                "close": float(v["close"]),
+            })
         except Exception:
+            # ข้ามแถวที่พาร์สไม่ได้
             continue
 
-    if not rows:
+    if not bars:
         raise HTTPException(status_code=502, detail="Cannot parse bars")
-    return rows  # ล่าสุด -> เก่า
+    # TwelveData order=desc => แท่งล่าสุดอยู่ index 0
+    return bars
 
-# ---------- Swings ----------
-def _is_swing_high(highs: List[float], i: int, k: int) -> bool:
-    L = len(highs)
-    left = max(0, i - k)
-    right = min(L, i + k + 1)
-    base = highs[i]
-    for j in range(left, right):
-        if j == i:
+def is_pivot_high(bars: List[Dict[str, Any]], i: int, left: int, right: int) -> bool:
+    h = bars[i]["high"]
+    for k in range(i - left, i + right + 1):
+        if k == i or k < 0 or k >= len(bars):
             continue
-        if highs[j] >= base:
+        if bars[k]["high"] >= h:
             return False
     return True
 
-def _is_swing_low(lows: List[float], i: int, k: int) -> bool:
-    L = len(lows)
-    left = max(0, i - k)
-    right = min(L, i + k + 1)
-    base = lows[i]
-    for j in range(left, right):
-        if j == i:
+def is_pivot_low(bars: List[Dict[str, Any]], i: int, left: int, right: int) -> bool:
+    l = bars[i]["low"]
+    for k in range(i - left, i + right + 1):
+        if k == i or k < 0 or k >= len(bars):
             continue
-        if lows[j] <= base:
+        if bars[k]["low"] <= l:
             return False
     return True
 
-def find_swings(bars_asc: List[Dict[str, Any]], k: int = 3) -> Dict[str, List[Dict[str, Any]]]:
-    highs = [b["high"] for b in bars_asc]
-    lows = [b["low"] for b in bars_asc]
-    sh, sl = [], []
-    for i in range(len(bars_asc)):
-        if _is_swing_high(highs, i, k):
-            sh.append({"idx": i, "price": highs[i], "dt": bars_asc[i]["dt"]})
-        if _is_swing_low(lows, i, k):
-            sl.append({"idx": i, "price": lows[i], "dt": bars_asc[i]["dt"]})
-    return {"swing_highs": sh, "swing_lows": sl}
+def swing_points(bars: List[Dict[str, Any]], left: int = 2, right: int = 2, max_points: int = 60):
+    highs: List[float] = []
+    lows: List[float] = []
+    # ใช้เฉพาะส่วนต้นของลิสต์ (แท่งล่าสุดๆ) 220 แท่งเพื่อเร็วขึ้น
+    rng = range(min(len(bars)-1, 219), -1, -1)
+    for i in rng:
+        if is_pivot_high(bars, i, left, right):
+            highs.append(bars[i]["high"])
+        if is_pivot_low(bars, i, left, right):
+            lows.append(bars[i]["low"])
+        if len(highs) >= max_points and len(lows) >= max_points:
+            break
+    return highs, lows
 
-def compute_sr_from_swings(bars_desc: List[Dict[str, Any]], take: int = 3) -> Dict[str, Any]:
-    bars_asc = list(reversed(bars_desc))  # เก่า -> ใหม่
-    swings = find_swings(bars_asc, k=3)
-
-    # เอาเฉพาะสวิงล่าสุด (เรียงใหม่ -> เก่า)
-    sh_sorted = sorted(swings["swing_highs"], key=lambda x: x["idx"], reverse=True)[:take]
-    sl_sorted = sorted(swings["swing_lows"], key=lambda x: x["idx"], reverse=True)[:take]
-
-    resistances = [round(x["price"], 2) for x in sh_sorted]
-    supports = [round(x["price"], 2) for x in sl_sorted]
-
-    return {
-        "resistances": resistances,
-        "supports": supports,
-        "resistance_value": (resistances[0] if resistances else round(max(b["high"] for b in bars_desc), 2)),
-        "support_value": (supports[0] if supports else round(min(b["low"] for b in bars_desc), 2)),
-    }
-
-# ---------- Order Blocks ----------
-def detect_order_blocks(bars_desc: List[Dict[str, Any]]) -> Dict[str, Any]:
+def find_order_blocks(bars: List[Dict[str, Any]]) -> Dict[str, Optional[Dict[str, Any]]]:
     """
-    Heuristic:
-      - หา swing ล่าสุด (จาก bars_asc)
-      - หาก close ทะลุ swing high ล่าสุด -> bullish BOS
-        -> หาแท่งแดงล่าสุด “ก่อนหน้า BOS” ภายใน 10 แท่ง แล้วสร้าง zone = [open, low]
-      - หาก close ทะลุ swing low ล่าสุด -> bearish BOS
-        -> หาแท่งเขียวล่าสุด “ก่อนหน้า BOS” ภายใน 10 แท่ง แล้วสร้าง zone = [high, open]
-    ส่งกลับ { "bullish": {...} | None, "bearish": {...} | None }
+    heuristic เบาๆ:
+    - Bullish OB: หาแท่งแดง (close<open) แล้วแท่งถัดไปปิดสูงกว่า high ของแท่งแดง => zone = [low(แดง), open(แดง)]
+    - Bearish OB: หาแท่งเขียว (close>open) แล้วแท่งถัดไปปิดต่ำกว่า low ของแท่งเขียว => zone = [open(เขียว), high(เขียว)]
+    ส่งกลับเฉพาะล่าสุด (อย่างละ 1)
     """
-    bars_asc = list(reversed(bars_desc))
-    swings = find_swings(bars_asc, k=3)
-    if not swings["swing_highs"] and not swings["swing_lows"]:
-        return {"bullish": None, "bearish": None}
-
-    last_idx = len(bars_asc) - 1
-    last_close = bars_asc[last_idx]["close"]
-
-    # ---- Bullish BOS ----
     bull = None
-    last_sh = max(swings["swing_highs"], key=lambda x: x["idx"]) if swings["swing_highs"] else None
-    if last_sh and last_close > last_sh["price"]:
-        # จุด BOS = จุดที่ปิดทะลุ (หาจากหลังมาหน้า)
-        bos_i = None
-        for i in range(last_idx, last_sh["idx"], -1):
-            if bars_asc[i]["close"] > last_sh["price"]:
-                bos_i = i
-                break
-        if bos_i is not None:
-            # หาแท่งแดงล่าสุดก่อน bos_i ภายใน 10 แท่ง
-            start = max(last_sh["idx"], bos_i - 10)
-            ob_i = None
-            for j in range(bos_i - 1, start - 1, -1):
-                if bars_asc[j]["close"] < bars_asc[j]["open"]:
-                    ob_i = j
-                    break
-            if ob_i is not None:
-                ob_bar = bars_asc[ob_i]
-                bull = {
-                    "type": "bullish",
-                    "bar": {
-                        "dt": ob_bar["dt"],
-                        "open": ob_bar["open"],
-                        "high": ob_bar["high"],
-                        "low": ob_bar["low"],
-                        "close": ob_bar["close"],
-                    },
-                    "zone": [round(ob_bar["open"], 2), round(ob_bar["low"], 2)],  # [บน, ล่าง]
-                }
-
-    # ---- Bearish BOS ----
     bear = None
-    last_sl = max(swings["swing_lows"], key=lambda x: x["idx"]) if swings["swing_lows"] else None
-    if last_sl and last_close < last_sl["price"]:
-        bos_i = None
-        for i in range(last_idx, last_sl["idx"], -1):
-            if bars_asc[i]["close"] < last_sl["price"]:
-                bos_i = i
-                break
-        if bos_i is not None:
-            start = max(last_sl["idx"], bos_i - 10)
-            ob_i = None
-            for j in range(bos_i - 1, start - 1, -1):
-                if bars_asc[j]["close"] > bars_asc[j]["open"]:
-                    ob_i = j
-                    break
-            if ob_i is not None:
-                ob_bar = bars_asc[ob_i]
-                bear = {
-                    "type": "bearish",
-                    "bar": {
-                        "dt": ob_bar["dt"],
-                        "open": ob_bar["open"],
-                        "high": ob_bar["high"],
-                        "low": ob_bar["low"],
-                        "close": ob_bar["close"],
-                    },
-                    "zone": [round(ob_bar["high"], 2), round(ob_bar["open"], 2)],  # [บน, ล่าง]
-                }
-
+    # ใช้ 120 แท่งล่าสุด
+    N = min(len(bars)-1, 119)
+    for i in range(N, 0, -1):
+        cur = bars[i]
+        nxt = bars[i-1]  # เพราะ desc: i-1 คือถัดไป
+        # Bullish
+        if cur["close"] < cur["open"] and nxt["close"] > cur["high"]:
+            bull = {
+                "type": "bullish",
+                "zone": [round(cur["low"], 2), round(cur["open"], 2)],
+                "bar": cur
+            }
+            break
+    N = min(len(bars)-1, 119)
+    for i in range(N, 0, -1):
+        cur = bars[i]
+        nxt = bars[i-1]
+        # Bearish
+        if cur["close"] > cur["open"] and nxt["close"] < cur["low"]:
+            bear = {
+                "type": "bearish",
+                "zone": [round(cur["open"], 2), round(cur["high"], 2)],
+                "bar": cur
+            }
+            break
     return {"bullish": bull, "bearish": bear}
 
-def build_tf_payload(norm_symbol: str, tf: str) -> Dict[str, Any]:
-    bars_desc = fetch_series(norm_symbol, tf, size=250)
-    last = bars_desc[0]
+def analyze_tf(bars: List[Dict[str, Any]], tf: str) -> Dict[str, Any]:
+    last = bars[0]
+    # หา swing high/low
+    highs, lows = swing_points(bars, left=2, right=2, max_points=80)
+    # resistance/support ตัวหลักเอาอันแรกของลิสต์ (ล่าสุด)
+    resistance = round(highs[0], 2) if highs else None
+    support    = round(lows[0], 2)  if lows  else None
 
-    sr = compute_sr_from_swings(bars_desc, take=3)
-    ob = detect_order_blocks(bars_desc)
-
+    # order blocks
+    obs = find_order_blocks(bars)
     return {
         "tf": tf,
-        "last_bar": {
-            "dt": last["dt"],
-            "open": last["open"],
-            "high": last["high"],
-            "low": last["low"],
-            "close": last["close"],
-        },
-        # R/S (แบบเดี่ยว + ลิสต์)
-        "resistance": sr["resistance_value"],
-        "support": sr["support_value"],
-        "resistances": sr["resistances"],
-        "supports": sr["supports"],
-        # Order Blocks
-        "order_blocks": ob,  # {"bullish": {...}|None, "bearish": {...}|None}
+        "last_bar": last,
+        "resistance": resistance,
+        "support": support,
+        "resistances": [round(x, 2) for x in highs[:5]],
+        "supports":    [round(x, 2) for x in lows[:5]],
+        "order_blocks": obs
     }
 
-# =========================
-# Routes
-# =========================
+# ---------- Routes ----------
 @app.get("/")
 def root():
     return {"app": "xau-scanner", "version": APP_VERSION, "ok": True}
 
 @app.get("/health")
 def health():
-    return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
+    return {"ok": True, "ts": datetime.utcnow().isoformat() + "Z"}
 
 @app.post("/structure")
 def structure(req: StructureRequest):
+    symbol = normalize_symbol(req.symbol)
+    out: Dict[str, Any] = {"status": "OK", "symbol": symbol, "results": []}
     try:
-        norm_symbol = normalize_symbol(req.symbol)
-        results: List[Dict[str, Any]] = [build_tf_payload(norm_symbol, tf) for tf in req.tfs]
-        return {"status": "OK", "symbol": norm_symbol, "results": results}
+        for tf in req.tfs:
+            bars = fetch_series(symbol, tf, size=250)
+            out["results"].append(analyze_tf(bars, tf))
+        return out
     except HTTPException:
         raise
     except Exception as e:
