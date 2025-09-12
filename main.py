@@ -2,13 +2,14 @@
 import os
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
+from datetime import datetime, timezone
+
+import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from datetime import datetime, timezone
-import requests
 
-APP_VERSION = "2025-09-12.dynamic-rs-2"
+APP_VERSION = "2025-09-12.dynamic-rs-3"  # ปรับเลขเพื่อยืนยันว่าเป็นไฟล์ล่าสุด
 
 # =========================
 # Config
@@ -47,13 +48,12 @@ class StructureRequest(BaseModel):
 # Helpers
 # =========================
 def normalize_symbol(sym: str) -> str:
-    """Auto convert XAUUSD -> XAU/USD (รองรับ 6 ตัวอักษรทั่วไป)"""
+    """Convert XAUUSD -> XAU/USD เมื่อเป็นโค้ด 6 ตัวทั่วไป"""
     s = (sym or "").upper().replace(" ", "")
     if "/" in s:
         return s
     if len(s) == 6:
-        base, quote = s[:3], s[3:]
-        return f"{base}/{quote}"
+        return f"{s[:3]}/{s[3:]}"
     return s
 
 
@@ -123,30 +123,23 @@ def fetch_bars(symbol: str, tf: str, size: int = 300) -> List[Candle]:
                 )
             )
         except Exception:
-            # skip bad row
-            continue
+            continue  # skip bad row
 
     if not bars:
         raise HTTPException(status_code=502, detail="Cannot parse bars")
-    return bars  # latest first (closed)
+    return bars  # latest closed bar first
 
 
 def last_closed(bars: List[Candle]) -> Candle:
-    # TwelveData with order=desc already returns closed bars; index 0 is latest closed
     return bars[0]
 
 
 def detect_swings(bars: List[Candle], left: int = 2, right: int = 2) -> Dict[str, List[float]]:
-    """
-    หา Swing High/Low แบบเรียบง่าย:
-    - swing high: high[i] > high[i-1..i-left] และ > high[i+1..i+right]
-    - swing low : low[i]  < low[i-1..i-left]  และ < low[i+1..i+right]
-    """
+    """หา Swing High/Low แบบง่าย"""
     highs: List[float] = []
     lows: List[float] = []
-    n = len(bars)
-    # bars เป็นล่าสุดก่อน → กลับเป็นเก่าก่อนเพื่อดูเพื่อนบ้านง่าย
     seq = list(reversed(bars))  # old -> new
+    n = len(seq)
     for i in range(left, n - right):
         h = seq[i].high
         l = seq[i].low
@@ -156,33 +149,22 @@ def detect_swings(bars: List[Candle], left: int = 2, right: int = 2) -> Dict[str
             highs.append(h)
         if is_sl:
             lows.append(l)
-    # เรียงจากใหม่ไปเก่าเพื่อเลือกใกล้ราคาได้ไว
-    highs = sorted(highs, reverse=True)
-    lows = sorted(lows, reverse=True)
+    highs.sort(reverse=True)
+    lows.sort(reverse=True)
     return {"swing_highs": highs, "swing_lows": lows}
 
 
 def nearest_levels_above_below(current: float, highs: List[float], lows: List[float]) -> Dict[str, Optional[float]]:
-    """
-    เลือก Resistance เป็น swing high ที่ 'สูงกว่า' current และ 'ใกล้ที่สุด'
-    เลือก Support   เป็น swing low  ที่ 'ต่ำกว่า' current และ 'ใกล้ที่สุด'
-    ถ้าไม่มีฝั่งใด ให้ fallback เป็น max(highs) / min(lows) เพื่อไม่คืน None
-    """
+    """เลือกแนวต้าน/แนวรับที่ใกล้ปัจจุบันที่สุด (มี fallback)"""
     above = [h for h in highs if h > current]
     below = [l for l in lows if l < current]
-
     res = min(above, key=lambda x: x - current) if above else (max(highs) if highs else None)
     sup = max(below, key=lambda x: current - x) if below else (min(lows) if lows else None)
-
     return {"resistance": res, "support": sup}
 
 
 def find_order_blocks(bars: List[Candle], window: int = 40, body_ratio: float = 0.6) -> List[Dict[str, Any]]:
-    """
-    หาโซน Order Block แบบเบา ๆ:
-      - มองหาระยะสะสมสั้น ๆ ต่อด้วยแท่งทะลุที่มี body ใหญ่ (>= body_ratio ของ high-low)
-      - คืนช่วงราคา [low, high] ของโซนสะสมสุดท้ายก่อนเบรก
-    """
+    """หาโซน OB แบบเบา ๆ"""
     seq = list(reversed(bars))[:window]  # old -> new
     out: List[Dict[str, Any]] = []
     if len(seq) < 5:
@@ -192,7 +174,7 @@ def find_order_blocks(bars: List[Candle], window: int = 40, body_ratio: float = 
         return abs(c.close - c.open)
 
     for i in range(3, len(seq) - 1):
-        zone = seq[i - 3 : i]  # 3 แท่งก่อนหน้า
+        zone = seq[i - 3 : i]
         z_high = max(c.high for c in zone)
         z_low = min(c.low for c in zone)
         brk = seq[i]
@@ -204,7 +186,7 @@ def find_order_blocks(bars: List[Candle], window: int = 40, body_ratio: float = 
                 out.append({"type": "bullish", "range": [round(z_low, 2), round(z_high, 2)]})
             elif brk.close < z_low:
                 out.append({"type": "bearish", "range": [round(z_low, 2), round(z_high, 2)]})
-    return out[-2:]  # เอา 2 ล่าสุดพอ
+    return out[-2:]  # ล่าสุด 2 ก้อน
 
 
 def fmt2(x: Optional[float]) -> Optional[float]:
@@ -216,7 +198,7 @@ def fmt2(x: Optional[float]) -> Optional[float]:
 # =========================
 def build_structure(symbol_raw: str, tfs: List[str]) -> Dict[str, Any]:
     """
-    คืนรูปแบบผลลัพธ์คงที่:
+    ผลลัพธ์คงที่:
     {
       "symbol": "XAU/USD",
       "result": {
@@ -224,9 +206,8 @@ def build_structure(symbol_raw: str, tfs: List[str]) -> Dict[str, Any]:
           "last_bar": {...},
           "resistance": float|None,
           "support": float|None,
-          "order_blocks": [ ... ]   # list (อาจว่าง)
-        },
-        ...
+          "order_blocks": [ ... ]   # เป็น list เสมอ (อาจว่าง)
+        }, ...
       }
     }
     """
@@ -235,7 +216,6 @@ def build_structure(symbol_raw: str, tfs: List[str]) -> Dict[str, Any]:
 
     for tf in tfs:
         try:
-            # --- ดึงข้อมูล ---
             bars = fetch_bars(symbol, tf, size=300)
             last = last_closed(bars)
             swings = detect_swings(bars, left=2, right=2)
@@ -257,8 +237,12 @@ def build_structure(symbol_raw: str, tfs: List[str]) -> Dict[str, Any]:
             if support is not None and support >= current:
                 support = fmt2(min(current - 0.01, last.low))
 
-            # --- หา OB (กัน None) ---
-            order_blocks = find_order_blocks(bars, window=40) or []
+            # --- หา OB (กัน None + กันพังเสมอ) ---
+            try:
+                tmp = find_order_blocks(bars, window=40)
+                order_blocks = tmp if isinstance(tmp, list) else []
+            except Exception:
+                order_blocks = []
 
             # --- บันทึกผล ---
             result["result"][tf.upper()] = {
@@ -271,7 +255,7 @@ def build_structure(symbol_raw: str, tfs: List[str]) -> Dict[str, Any]:
                 },
                 "resistance": resistance,
                 "support": support,
-                "order_blocks": order_blocks,
+                "order_blocks": order_blocks,  # กำหนดแน่นอน
             }
 
         except Exception as e:
@@ -300,7 +284,6 @@ def structure_post(req: StructureRequest):
     try:
         allowed = {"M5", "M15", "M30", "H1", "H4", "D1"}
 
-        # รวม tf เดี่ยว + tfs หลายค่า (ถ้ามี)
         raw_tfs: List[str] = []
         if req.tfs:
             raw_tfs.extend(req.tfs)
@@ -309,7 +292,6 @@ def structure_post(req: StructureRequest):
 
         tfs = [t.upper() for t in raw_tfs if t and t.upper() in allowed]
         if not tfs:
-            # ค่า default เป็น H1 ถ้าไม่ได้ส่งมา
             tfs = ["H1"]
 
         return build_structure(req.symbol, tfs)
@@ -319,7 +301,7 @@ def structure_post(req: StructureRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ---- GET (query) สำหรับความเข้ากันได้/ทดสอบง่าย ----
+# ---- GET (query) สำหรับทดสอบง่าย/ความเข้ากันได้ ----
 @app.get("/structure")
 def structure_get(
     symbol: str = Query(..., description="e.g. XAUUSD or XAU/USD"),
@@ -328,6 +310,7 @@ def structure_get(
 ):
     try:
         allowed = {"M5", "M15", "M30", "H1", "H4", "D1"}
+
         raw_tfs: List[str] = []
         if tfs:
             raw_tfs.extend([x.strip() for x in tfs.split(",") if x.strip()])
