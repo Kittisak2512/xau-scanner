@@ -2,21 +2,31 @@
 import os
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-import requests
 from datetime import datetime, timezone
 
-APP_VERSION = "2025-09-12.3"
+import requests
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, field_validator
 
-# ---------- Config ----------
-TD_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
-ALLOWED = os.getenv("ALLOWED_ORIGINS", "*").strip()
-ALLOW_ORIGINS = ["*"] if ALLOWED in ("", "*") else [o.strip() for o in ALLOWED.split(",") if o.strip()]
+APP_VERSION = "2025-09-12.stable-A2"
 
-# ---------- FastAPI ----------
+# ------------------------------------------------------------
+# Environment / Config
+# ------------------------------------------------------------
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
+_ALLOWED = os.getenv("ALLOWED_ORIGINS", "*").strip()
+
+if _ALLOWED in ("", "*"):
+    ALLOW_ORIGINS = ["*"]
+else:
+    ALLOW_ORIGINS = [o.strip() for o in _ALLOWED.split(",") if o.strip()]
+
+# ------------------------------------------------------------
+# FastAPI App
+# ------------------------------------------------------------
 app = FastAPI(title="xau-scanner", version=APP_VERSION)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOW_ORIGINS,
@@ -25,29 +35,58 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- Models ----------
+# ------------------------------------------------------------
+# Models
+# ------------------------------------------------------------
 class StructureRequest(BaseModel):
     symbol: str = Field(..., examples=["XAUUSD", "XAU/USD"])
-    tfs: List[str] = Field(..., examples=[["M5", "M15", "M30", "H1", "H4", "D1"]])
+    tfs: List[str] = Field(..., description="List of TFs e.g. ['M5','M15','M30','H1','H4','D1']")
 
-@dataclass
-class Candle:
-    dt: str
+    @field_validator("tfs")
+    @classmethod
+    def check_tfs(cls, v: List[str]) -> List[str]:
+        ok = {"M5", "M15", "M30", "H1", "H4", "D1"}
+        vv = [s.upper().strip() for s in v]
+        bad = [s for s in vv if s not in ok]
+        if bad:
+            raise ValueError(f"Unsupported TF(s): {bad}. Allowed: {sorted(ok)}")
+        return vv
+
+
+class Candle(BaseModel):
+    datetime: str
     open: float
     high: float
     low: float
     close: float
 
-# ---------- Utils ----------
-def normalize_symbol(sym: str) -> str:
-    s = sym.upper().replace(" ", "")
-    if "/" not in s and len(s) >= 6:
-        # พวก XAUUSD, EURUSD => ใส่ /
-        s = s[:3] + "/" + s[3:]
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+def normalize_symbol(s: str) -> str:
+    """
+    แปลงสัญลักษณ์ให้ TwelveData เข้าใจได้แน่นอน
+    - XAUUSD / XAU USD / XAU-USD / XAU_USD / GOLD -> XAU/USD
+    - ถ้าเป็นรูปแบบ 6 ตัวอักษร (เช่น EURUSD) จะถูกแบ่งเป็น EUR/USD
+    """
+    s = (s or "").strip().upper()
+    aliases = {
+        "XAUUSD": "XAU/USD",
+        "XAU-USD": "XAU/USD",
+        "XAU_USD": "XAU/USD",
+        "GOLD": "XAU/USD",
+    }
+    if s in aliases:
+        return aliases[s]
+    if " " in s and s.replace(" ", "") == "XAUUSD":
+        return "XAU/USD"
+    if "/" not in s and len(s) == 6:
+        return s[:3] + "/" + s[3:]
     return s
 
-def td_interval(tf: str) -> str:
-    m = tf.upper()
+
+def tf_to_interval(tf: str) -> str:
     mapping = {
         "M5": "5min",
         "M15": "15min",
@@ -56,182 +95,216 @@ def td_interval(tf: str) -> str:
         "H4": "4h",
         "D1": "1day",
     }
-    if m not in mapping:
-        raise HTTPException(status_code=400, detail=f"Unsupported timeframe: {tf}")
-    return mapping[m]
+    if tf not in mapping:
+        raise ValueError(f"Unsupported TF: {tf}")
+    return mapping[tf]
 
-def fetch_series(symbol: str, tf: str, size: int = 300) -> List[Candle]:
-    if not TD_API_KEY:
+
+def safe_float(x, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def fetch_series(symbol: str, tf: str, size: int = 200) -> List[Candle]:
+    if not TWELVEDATA_API_KEY:
         raise HTTPException(status_code=500, detail="Missing TWELVEDATA_API_KEY")
+
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol,
-        "interval": td_interval(tf),
+        "interval": tf_to_interval(tf),
         "outputsize": size,
-        "order": "desc",      # latest first
+        "order": "desc",           # ล่าสุดอยู่ก่อน
         "timezone": "UTC",
-        "apikey": TD_API_KEY,
+        "apikey": TWELVEDATA_API_KEY,
     }
-    r = requests.get(url, params=params, timeout=20)
     try:
+        r = requests.get(url, params=params, timeout=25)
         data = r.json()
     except Exception:
-        raise HTTPException(status_code=502, detail="Upstream returned non-JSON.")
+        raise HTTPException(status_code=502, detail="Upstream returned non-JSON")
 
     if isinstance(data, dict) and data.get("status") == "error":
-        raise HTTPException(status_code=502, detail=data.get("message", "API error"))
+        # ส่ง error ต้นทางออกไปแบบชัดเจน
+        raise HTTPException(status_code=502, detail=data.get("message", "Upstream error."))
 
     values = data.get("values")
     if not values:
-        raise HTTPException(status_code=502, detail="No data from TwelveData.")
+        raise HTTPException(status_code=502, detail="No data from upstream.")
 
-    candles: List[Candle] = []
+    out: List[Candle] = []
     for v in values:
-        try:
-            candles.append(
-                Candle(
-                    dt=v["datetime"],
-                    open=float(v["open"]),
-                    high=float(v["high"]),
-                    low=float(v["low"]),
-                    close=float(v["close"]),
-                )
-            )
-        except Exception:
+        c = Candle(
+            datetime=v["datetime"],
+            open=float(v["open"]),
+            high=float(v["high"]),
+            low=float(v["low"]),
+            close=float(v["close"]),
+        )
+        out.append(c)
+    return out  # ล่าสุด -> เก่า
+
+
+# ------------------------------------------------------------
+# Core analytics (โครงสร้าง: Resistance / Support / Order Blocks)
+# ------------------------------------------------------------
+def compute_nearest_levels(bars: List[Candle]) -> Dict[str, Optional[float]]:
+    """
+    หา Resistance / Support ใกล้เคียง 'ราคาปิดแท่งล่าสุด' โดยบังคับเงื่อนไข:
+      - resistance > last_close
+      - support    < last_close
+    วิธีเลือก: ใช้ highs/lows ย้อนหลัง (lookback 120 แท่ง) แล้วหาค่าที่ 'ใกล้ที่สุด' ฝั่งบน/ล่าง
+    """
+    if not bars:
+        return {"resistance": None, "support": None}
+
+    last = bars[0]
+    last_close = last.close
+    highs = [b.high for b in bars[:120]]
+    lows = [b.low for b in bars[:120]]
+
+    above = [h for h in highs if h > last_close]
+    below = [l for l in lows if l < last_close]
+
+    resistance = min(above) if above else (max(highs) if highs else None)
+    support = max(below) if below else (min(lows) if lows else None)
+
+    return {
+        "resistance": safe_float(resistance),
+        "support": safe_float(support),
+    }
+
+
+def detect_order_blocks(bars: List[Candle], max_blocks: int = 4) -> List[Dict[str, Any]]:
+    """
+    ตรวจ OB แบบ conservative และกัน null:
+      - Bullish OB: หา 'แท่งแดง' (close<open) ที่ก่อนหน้าการวิ่งขึ้นชัดเจน
+        แล้วให้ช่วงโซน = [low, open] ของแท่งแดงนั้น
+      - Bearish OB: ตรงข้าม → โซน = [open, high] ของแท่งเขียวนั้น
+    หมายเหตุ: เป็น heuristic บาง ๆ เพื่อให้ได้โซนที่สม่ำเสมอและไม่คืน [null,null]
+    """
+    out: List[Dict[str, Any]] = []
+    if len(bars) < 20:
+        return out
+
+    # ใช้ข้อมูลย้อนหลัง ~120 แท่ง (ล่าสุด -> เก่า)
+    window = bars[:120][::-1]  # เก่าสุด -> ล่าสุด เพื่อหา pattern แบบเดินหน้า
+
+    # หา impulse ขึ้น/ลงแบบง่าย ๆ
+    ups = []
+    downs = []
+    for i in range(2, len(window)):
+        # 3 แท่งเขียวติด = impulse ขึ้น
+        if window[i-2].close > window[i-2].open and window[i-1].close > window[i-1].open and window[i].close > window[i].open:
+            ups.append(i)
+        # 3 แท่งแดงติด = impulse ลง
+        if window[i-2].close < window[i-2].open and window[i-1].close < window[i-1].open and window[i].close < window[i].open:
+            downs.append(i)
+
+    # Bullish OB: หาแท่งแดงก่อนหน้า cluster เขียว
+    for idx in ups[::-1]:  # เริ่มจากอันล่าสุด
+        j = idx - 3
+        if j <= 0:
             continue
-    if not candles:
-        raise HTTPException(status_code=502, detail="Cannot parse bars.")
-    return candles  # latest first
+        # ไล่กลับไปหา "แท่งแดงล่าสุด" ก่อน impulse
+        k = j
+        while k >= 0 and not (window[k].close < window[k].open):
+            k -= 1
+        if k >= 0:
+            low = safe_float(window[k].low)
+            open_ = safe_float(window[k].open)
+            if low is not None and open_ is not None:
+                lo, hi = sorted([low, open_])
+                out.append({"type": "bullish", "zone": [round(lo, 2), round(hi, 2)]})
+        if len(out) >= max_blocks:
+            break
 
-# สวิงไฮ/โล แบบพื้นฐาน: prev < cur > next (swing high), prev > cur < next (swing low)
-def swing_points(bars: List[Candle], lookback: int = 200) -> Dict[str, List[float]]:
-    seq = list(reversed(bars[: lookback + 2]))  # เก่าสุด -> ล่าสุด
-    highs: List[float] = []
-    lows: List[float] = []
-    for i in range(1, len(seq) - 1):
-        a, b, c = seq[i - 1], seq[i], seq[i + 1]
-        if b.high > a.high and b.high > c.high:
-            highs.append(b.high)
-        if b.low < a.low and b.low < c.low:
-            lows.append(b.low)
-    return {"highs": highs, "lows": lows}
+    # Bearish OB: หาแท่งเขียวก่อนหน้า cluster แดง
+    for idx in downs[::-1]:
+        j = idx - 3
+        if j <= 0:
+            continue
+        k = j
+        while k >= 0 and not (window[k].close > window[k].open):
+            k -= 1
+        if k >= 0:
+            open_ = safe_float(window[k].open)
+            high = safe_float(window[k].high)
+            if open_ is not None and high is not None:
+                lo, hi = sorted([open_, high])
+                out.append({"type": "bearish", "zone": [round(lo, 2), round(hi, 2)]})
+        if len(out) >= max_blocks:
+            break
 
-def nearest_levels_from_swings(bars: List[Candle]) -> Dict[str, Optional[float]]:
-    last_close = bars[0].close
-    sp = swing_points(bars, lookback=220)
-    highs = sorted(set(sp["highs"]))
-    lows = sorted(set(sp["lows"]))
+    # จำกัดจำนวนและจัดลำดับให้ล่าสุดอยู่หน้า (โซนใกล้ปัจจุบันมีลำดับก่อน)
+    return out[:max_blocks]
 
-    # resistance: ไฮที่อยู่ "เหนือ" close และใกล้ที่สุด
-    resistance_candidates = [h for h in highs if h > last_close]
-    resistance = min(resistance_candidates) if resistance_candidates else None
 
-    # support: โลที่อยู่ "ต่ำกว่า" close และใกล้ที่สุด
-    support_candidates = [l for l in lows if l < last_close]
-    support = max(support_candidates) if support_candidates else None
+def build_tf_block(symbol: str, tf: str) -> Dict[str, Any]:
+    series = fetch_series(symbol, tf, size=200)
+    last = series[0]
+    lv = compute_nearest_levels(series)
+    obs = detect_order_blocks(series)
 
-    # fallback (เผื่อ lookback ไม่เจอ)
-    if resistance is None:
-        resistance = max(x.high for x in bars[:100])
-        if resistance <= last_close:
-            resistance = last_close + 5  # กันไม่ให้ต่ำกว่า close
-    if support is None:
-        support = min(x.low for x in bars[:100])
-        if support >= last_close:
-            support = last_close - 5
+    return {
+        "tf": tf,
+        "last_bar": {
+            "dt": last.datetime,
+            "open": round(last.open, 2),
+            "high": round(last.high, 2),
+            "low": round(last.low, 2),
+            "close": round(last.close, 2),
+        },
+        "resistance": None if lv["resistance"] is None else round(lv["resistance"], 2),
+        "support": None if lv["support"] is None else round(lv["support"], 2),
+        "order_blocks": obs,  # list[{type, zone:[lo,hi]}]
+    }
 
-    return {"support": round(support, 2), "resistance": round(resistance, 2), "close": last_close}
 
-def detect_order_blocks(bars: List[Candle], lookback: int = 150) -> List[Dict[str, Any]]:
-    """ค้นหา OB แบบเรียบง่าย และป้องกันค่า null/null"""
-    zones: List[Dict[str, Any]] = []
-    n = min(len(bars), lookback + 3)
-    seq = list(reversed(bars[:n]))  # เก่าสุด -> ล่าสุด
-
-    for i in range(len(seq) - 2):
-        a, b, c = seq[i], seq[i + 1], seq[i + 2]
-
-        # Bullish OB: down → up → up (และมี expansion ต่อเนื่อง)
-        if a.open > a.close and b.close > b.open and c.close > c.open and b.high < c.high:
-            low, high = min(a.open, a.close), max(a.open, a.close)
-            if low is not None and high is not None:
-                zones.append({"type": "bullish", "zone": [round(low, 2), round(high, 2)]})
-
-        # Bearish OB: up → down → down
-        if a.close > a.open and b.close < b.open and c.close < c.open and b.low > c.low:
-            low, high = min(a.open, a.close), max(a.open, a.close)
-            if low is not None and high is not None:
-                zones.append({"type": "bearish", "zone": [round(low, 2), round(high, 2)]})
-
-    return zones[-4:]  # เอาเฉพาะล่าสุดไม่เกิน 4 โซน
-
-# ---------- Routes ----------
+# ------------------------------------------------------------
+# Routes
+# ------------------------------------------------------------
 @app.get("/")
 def root():
     return {"app": "xau-scanner", "version": APP_VERSION, "ok": True}
+
 
 @app.get("/health")
 def health():
     return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
 
+
 @app.post("/structure")
 def structure(req: StructureRequest):
     symbol = normalize_symbol(req.symbol)
-    tfs = [tf.upper() for tf in req.tfs]
-    supported = {"M5", "M15", "M30", "H1", "H4", "D1"}
-    for tf in tfs:
-        if tf not in supported:
-            raise HTTPException(status_code=400, detail=f"Unsupported TF: {tf}")
+    results: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
 
-    out: Dict[str, Any] = {
-        "status": "OK",
+    for tf in req.tfs:
+        try:
+            block = build_tf_block(symbol, tf)
+            results.append(block)
+        except HTTPException as he:
+            # ส่ง error ต้นทางต่อ TF นั้น ๆ แต่ไม่ล้มทั้งงาน
+            errors.append({"tf": tf, "error": str(he.detail)})
+        except Exception as e:
+            errors.append({"tf": tf, "error": str(e)})
+
+    status = "OK"
+    if errors and results:
+        status = "PARTIAL"
+    elif errors and not results:
+        # ไม่มีผลลัพธ์เลย
+        status = "ERROR"
+
+    return {
+        "status": status,
         "scanned_at": datetime.now(timezone.utc).isoformat(),
         "symbol": symbol,
-        "results": [],
-        "errors": [],
+        "results": results,
+        "errors": errors,
     }
-
-    for tf in tfs:
-        try:
-            bars = fetch_series(symbol, tf, size=320)
-            last = bars[0]
-            levels = nearest_levels_from_swings(bars)
-
-            # บังคับเงื่อนไข: resistance > close, support < close
-            close = last.close
-            resistance = levels["resistance"]
-            support = levels["support"]
-            if resistance <= close:
-                resistance = round(close + 5, 2)
-            if support >= close:
-                support = round(close - 5, 2)
-
-            obs = detect_order_blocks(bars, lookback=150)
-
-            out["results"].append(
-                {
-                    "tf": tf,
-                    "last_bar": {
-                        "dt": last.dt,
-                        "open": round(last.open, 2),
-                        "high": round(last.high, 2),
-                        "low": round(last.low, 2),
-                        "close": round(last.close, 2),
-                    },
-                    "resistance": resistance,
-                    "support": support,
-                    "order_blocks": obs,  # ถ้าไม่เจอ = []
-                }
-            )
-        except HTTPException as he:
-            out["errors"].append({"tf": tf, "error": he.detail})
-        except Exception as e:
-            out["errors"].append({"tf": tf, "error": str(e)})
-
-    # ถ้าบาง TF ล้มเหลว
-    if out["errors"] and out["results"]:
-        out["status"] = "PARTIAL"
-    elif out["errors"] and not out["results"]:
-        out["status"] = "ERROR"
-
-    return out
