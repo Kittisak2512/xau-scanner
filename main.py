@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from datetime import datetime, timezone
 import requests
 
-APP_VERSION = "2025-09-12.dynamic-rs-1"
+APP_VERSION = "2025-09-12.dynamic-rs-2"
 
 # =========================
 # Config
@@ -212,46 +212,71 @@ def fmt2(x: Optional[float]) -> Optional[float]:
 
 
 # =========================
-# Core
+# Core (SAFE)
 # =========================
 def build_structure(symbol_raw: str, tfs: List[str]) -> Dict[str, Any]:
+    """
+    คืนรูปแบบผลลัพธ์คงที่:
+    {
+      "symbol": "XAU/USD",
+      "result": {
+        "H1": {
+          "last_bar": {...},
+          "resistance": float|None,
+          "support": float|None,
+          "order_blocks": [ ... ]   # list (อาจว่าง)
+        },
+        ...
+      }
+    }
+    """
     symbol = normalize_symbol(symbol_raw)
     result: Dict[str, Any] = {"symbol": symbol, "result": {}}
 
     for tf in tfs:
-        # ดึงข้อมูล
-        bars = fetch_bars(symbol, tf, size=300)
-        last = last_closed(bars)
-        swings = detect_swings(bars, left=2, right=2)
-        current = last.close
+        try:
+            # --- ดึงข้อมูล ---
+            bars = fetch_bars(symbol, tf, size=300)
+            last = last_closed(bars)
+            swings = detect_swings(bars, left=2, right=2)
+            current = last.close
 
-        # คำนวณระดับ
-        lv = nearest_levels_above_below(current, swings["swing_highs"], swings["swing_lows"])
-        resistance = fmt2(lv.get("resistance"))
-        support = fmt2(lv.get("support"))
+            # --- ค่าเริ่มต้นปลอดภัย ---
+            resistance: Optional[float] = None
+            support: Optional[float] = None
+            order_blocks: List[Dict[str, Any]] = []
 
-        # ปรับความสมเหตุสมผลเบื้องต้น
-        if resistance is not None and resistance <= current:
-            resistance = fmt2(max(current + 0.01, last.high))
-        if support is not None and support >= current:
-            support = fmt2(min(current - 0.01, last.low))
+            # --- คำนวณ R/S ---
+            lv = nearest_levels_above_below(current, swings["swing_highs"], swings["swing_lows"])
+            resistance = fmt2(lv.get("resistance"))
+            support = fmt2(lv.get("support"))
 
-        # หา OB (และบังคับ [] เมื่อไม่มี)
-        order_blocks: List[Dict[str, Any]] = find_order_blocks(bars, window=40) or []
+            # ปรับให้สมเหตุสมผลเบื้องต้น
+            if resistance is not None and resistance <= current:
+                resistance = fmt2(max(current + 0.01, last.high))
+            if support is not None and support >= current:
+                support = fmt2(min(current - 0.01, last.low))
 
-        # ใส่ผลลัพธ์ (กำหนดตัวแปรครบทุกคีย์เสมอ)
-        result["result"][tf.upper()] = {
-            "last_bar": {
-                "dt": last.dt,
-                "open": fmt2(last.open),
-                "high": fmt2(last.high),
-                "low": fmt2(last.low),
-                "close": fmt2(last.close),
-            },
-            "resistance": resistance if resistance is not None else None,
-            "support": support if support is not None else None,
-            "order_blocks": order_blocks,
-        }
+            # --- หา OB (กัน None) ---
+            order_blocks = find_order_blocks(bars, window=40) or []
+
+            # --- บันทึกผล ---
+            result["result"][tf.upper()] = {
+                "last_bar": {
+                    "dt": last.dt,
+                    "open": fmt2(last.open),
+                    "high": fmt2(last.high),
+                    "low": fmt2(last.low),
+                    "close": fmt2(last.close),
+                },
+                "resistance": resistance,
+                "support": support,
+                "order_blocks": order_blocks,
+            }
+
+        except Exception as e:
+            # เก็บ error ราย TF (ไม่ทำให้ทั้ง response ล้ม)
+            result["result"][tf.upper()] = {"error": str(e)}
 
     return result
 
